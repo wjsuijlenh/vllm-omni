@@ -19,6 +19,7 @@ from vllm_omni.diffusion.models.sana_wm.ar_rollout import (
     FIRST_CHUNK_PLUS_ONE,
     UNIFORM,
     ChunkSpan,
+    autoregressive_segments,
     commit_chunk_state,
     plan_chunks,
     slice_camera_frames,
@@ -68,6 +69,42 @@ def test_plan_chunks_validates_inputs() -> None:
         plan_chunks(10, 0)
     with pytest.raises(ValueError):
         plan_chunks(10, 3, "bogus")
+
+
+def _upstream_segments(total_frames: int, chunk_size: int) -> list[int]:
+    """Literal port of NVlabs/Sana create_autoregressive_segments (boundary list)."""
+    remained = total_frames % chunk_size
+    num_chunks = total_frames // chunk_size
+    indices = [0]
+    for i in range(num_chunks):
+        cur = indices[-1] + chunk_size + (remained if i == 0 else 0)
+        indices.append(cur)
+    return indices
+
+
+@pytest.mark.parametrize("total", [9, 10, 11, 12, 21, 41])
+def test_autoregressive_segments_match_upstream(total: int) -> None:
+    chunk_size = 3
+    spans = autoregressive_segments(total, chunk_size)
+    # Boundaries [0, e0, e1, ...] must equal the upstream sampler's indices.
+    boundaries = [spans[0].start] + [s.end for s in spans]
+    assert boundaries == _upstream_segments(total, chunk_size)
+    # First chunk absorbs the remainder; the rest are exactly chunk_size.
+    assert spans[0].num_frames == chunk_size + (total % chunk_size)
+    assert all(s.num_frames == chunk_size for s in spans[1:])
+    # Contiguous, non-overlapping, exact coverage.
+    assert spans[0].start == 0 and spans[-1].end == total
+    for prev, nxt in zip(spans, spans[1:]):
+        assert prev.end == nxt.start
+
+
+def test_autoregressive_segments_small_and_invalid() -> None:
+    # total <= chunk_size -> a single chunk covering everything.
+    assert autoregressive_segments(2, 3) == [ChunkSpan(index=0, start=0, end=2)]
+    with pytest.raises(ValueError):
+        autoregressive_segments(0, 3)
+    with pytest.raises(ValueError):
+        autoregressive_segments(10, 0)
 
 
 # -- per-step state seeding / capture ------------------------------------

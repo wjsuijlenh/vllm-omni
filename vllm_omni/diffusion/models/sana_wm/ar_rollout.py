@@ -108,6 +108,39 @@ def plan_chunks(
     return spans
 
 
+def autoregressive_segments(num_latent_frames: int, chunk_size: int) -> list[ChunkSpan]:
+    """Chunk spans matching the upstream SANA-WM inference sampler.
+
+    Mirrors ``SelfForcingFlowEuler.create_autoregressive_segments`` in
+    ``NVlabs/Sana`` (``diffusion/scheduler/self_forcing_flow_euler_sampler.py``):
+    the **first chunk absorbs the remainder** (``num_latent_frames % chunk_size``)
+    and every later chunk is exactly ``chunk_size``. Spans are contiguous and
+    non-overlapping -- each chunk denoises only its own frames; cross-chunk
+    context is carried through cached state, never by re-feeding a frame. This is
+    the segmentation the AR pipeline backend uses (preferred over the
+    ``first_chunk_plus_one`` name strategy, which only matches when the remainder
+    is 0 or 1).
+    """
+    if num_latent_frames <= 0:
+        raise ValueError(f"num_latent_frames must be positive, got {num_latent_frames}.")
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+    if num_latent_frames <= chunk_size:
+        # Upstream degenerates here (no chunks); cover everything in one chunk.
+        return [ChunkSpan(index=0, start=0, end=num_latent_frames)]
+
+    remainder = num_latent_frames % chunk_size
+    num_chunks = num_latent_frames // chunk_size
+    spans: list[ChunkSpan] = []
+    start = 0
+    for i in range(num_chunks):
+        length = chunk_size + (remainder if i == 0 else 0)
+        end = start + length
+        spans.append(ChunkSpan(index=i, start=start, end=end))
+        start = end
+    return spans
+
+
 def step_state(
     store: _GdnStateStore,
     *,

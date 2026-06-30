@@ -27,10 +27,8 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.sana_wm.ar_rollout import (
-    FIRST_CHUNK_PLUS_ONE,
-    ChunkSpan,
+    autoregressive_segments,
     commit_chunk_state,
-    plan_chunks,
     slice_camera_frames,
     step_state,
 )
@@ -932,17 +930,24 @@ class SanaWmPipeline(
         ``ar_rollout`` orchestration (CPU-tested); this method supplies the
         denoise loop, latent assembly, and per-chunk camera slicing.
 
-        Frame composition: chunk 0 spans frames ``[0, chunk_size+1)`` with frame 0
-        the image-conditioning latent; each later chunk prepends the previous
-        chunk's last (settled) frame as a read-only conditioning frame and
-        generates ``chunk_size`` new frames. Only the generated frames are written
-        back. The GDN scan resumes from the carried state on every chunk after the
-        first.
+        Frame composition (matches NVlabs/Sana
+        ``SelfForcingFlowEuler.create_autoregressive_segments``): chunks are
+        contiguous and non-overlapping (``autoregressive_segments``); each chunk
+        denoises only its own frames -- no frame is re-fed into a later chunk. The
+        clip's frame 0 is a one-time clean image anchor, held during chunk 0's
+        denoise; later chunks have no held frame, drawing cross-chunk context from
+        the carried GDN state. After a chunk settles, a single clean-sigma
+        (``timestep=0``) pass captures the terminal GDN state and commits it for
+        the next chunk -- the upstream ``save_kv_cache=True`` pass -- so the carry
+        reflects the settled latent, not the last noisy step.
 
-        NOTE: this path is numerically validated against the upstream chunk-causal
-        checkpoint on GPU (the equivalence step), not on CPU. The exact
-        ``first_chunk_plus_one`` composition above is the release-config reading
-        and is confirmed there.
+        Known limitation (upstream "Fix 3" not yet wired): the 5 softmax-attention
+        blocks have no cross-chunk sliding-window KV cache here, so they attend
+        only within the active chunk. Temporal coherence across chunk seams
+        therefore rests on the GDN carry alone until the softmax window is threaded
+        through ``GdnArState``'s sibling cache. The GDN single-block carry is
+        GPU-validated; full-pipeline equivalence against the checkpoint is a later
+        step.
         """
         params = self._native_params(payload, sampling_params)
         extra_args = self._extra_args(sampling_params)
@@ -991,7 +996,6 @@ class SanaWmPipeline(
 
         scheduler = SanaWmFlowMatchScheduler(params.num_inference_steps, shift=self.sana_wm_config.inference_flow_shift)
         timesteps = scheduler.timesteps(device=device)
-        num_steps = len(timesteps)
 
         allow_hash_fallback = bool(extra_args.get("sana_wm_hash_prompt_fallback", False))
         prompt_embeds, prompt_source = self._native_prompt_embeds(
@@ -1034,29 +1038,35 @@ class SanaWmPipeline(
         adapter.reset()
         adapter.create_state(1, dtype, device)
 
-        spans = plan_chunks(latent_frames, chunk_size, FIRST_CHUNK_PLUS_ONE)
+        spans = autoregressive_segments(latent_frames, chunk_size)
         for span in spans:
-            # Input range includes one leading conditioning frame: the image for
-            # chunk 0, the previous chunk's last settled frame otherwise.
-            input_start = span.start if span.is_first else span.start - 1
-            input_span = ChunkSpan(index=span.index, start=input_start, end=span.end)
-            chunk_latents = latents[:, :, input_start : span.end].contiguous()
-            cam_frames = input_span.num_frames
+            # Contiguous, non-overlapping chunk: denoise only this chunk's own
+            # frames (no re-fed previous frame). Cross-chunk context for the GDN
+            # blocks comes from the carried state, seeded on every step below.
+            chunk_latents = latents[:, :, span.start : span.end].contiguous()
+            cam_frames = span.num_frames
 
-            chunk_plucker = slice_camera_frames(plucker, input_span, frame_dim=1)
-            chunk_raymap = slice_camera_frames(raymap, input_span, frame_dim=0)
-            chunk_spatial = slice_camera_frames(spatial_raymap, input_span, frame_dim=1)
+            chunk_plucker = slice_camera_frames(plucker, span, frame_dim=1)
+            chunk_raymap = slice_camera_frames(raymap, span, frame_dim=0)
+            chunk_spatial = slice_camera_frames(spatial_raymap, span, frame_dim=1)
 
-            # Frame 0 of the chunk is the clean conditioning/seed frame, held at 0.
-            condition_mask = torch.zeros(1, 1, cam_frames, 1, 1, device=device, dtype=dtype)
-            condition_mask[:, :, 0] = 1.0
+            # Only the clip's global frame 0 is a clean anchor (held during
+            # denoise); it lives in chunk 0 at local index 0. Later chunks have no
+            # held frame -- every frame is generated.
+            anchor_local = 0 if span.start == 0 else None
+            condition_mask: torch.Tensor | None = None
+            if anchor_local is not None:
+                condition_mask = torch.zeros(1, 1, cam_frames, 1, 1, device=device, dtype=dtype)
+                condition_mask[:, :, anchor_local] = 1.0
 
-            for step_idx, timestep in enumerate(timesteps):
-                capture = step_idx == num_steps - 1
+            for timestep in timesteps:
                 model_timestep = timestep.float().expand(1, 1, cam_frames).clone()
-                model_timestep[:, :, 0] = 0.0
+                if anchor_local is not None:
+                    model_timestep[:, :, anchor_local] = 0.0
 
-                pos_state = step_state(adapter, is_first_chunk=span.is_first, capture=capture, is_negative=False)
+                # Seed the GDN scan from the carried state; do NOT capture during
+                # the noisy steps -- the carry is taken from the clean pass below.
+                pos_state = step_state(adapter, is_first_chunk=span.is_first, capture=False, is_negative=False)
                 noise_pred_cond = self.transformer(
                     chunk_latents,
                     model_timestep,
@@ -1068,7 +1078,7 @@ class SanaWmPipeline(
                     gdn_state=pos_state,
                 )
                 if do_cfg:
-                    neg_state = step_state(adapter, is_first_chunk=span.is_first, capture=capture, is_negative=True)
+                    neg_state = step_state(adapter, is_first_chunk=span.is_first, capture=False, is_negative=True)
                     noise_pred_uncond = self.transformer(
                         chunk_latents,
                         model_timestep,
@@ -1081,7 +1091,6 @@ class SanaWmPipeline(
                     )
                     noise_pred = noise_pred_uncond + params.cfg_scale * (noise_pred_cond - noise_pred_uncond)
                 else:
-                    neg_state = None
                     noise_pred = noise_pred_cond
 
                 pt_t = (
@@ -1091,16 +1100,46 @@ class SanaWmPipeline(
                     .reshape(1, -1)
                 )
                 stepped = scheduler.step_flow_euler_per_token(noise_pred, timestep, chunk_latents, pt_t)
-                tokens_to_denoise_mask = timestep / float(scheduler.num_train_timesteps) - 1e-6 < (1.0 - condition_mask)
-                chunk_latents = torch.where(tokens_to_denoise_mask, stepped, chunk_latents)
+                if condition_mask is not None:
+                    denoise_mask = timestep / float(scheduler.num_train_timesteps) - 1e-6 < (1.0 - condition_mask)
+                    chunk_latents = torch.where(denoise_mask, stepped, chunk_latents)
+                else:
+                    chunk_latents = stepped
 
-                if capture:
-                    commit_chunk_state(adapter, pos_state, is_negative=False)
-                    if neg_state is not None:
-                        commit_chunk_state(adapter, neg_state, is_negative=True)
+            # Write the settled chunk straight back -- no frame overlap.
+            latents[:, :, span.start : span.end] = chunk_latents
 
-            # Write back only the generated frames (skip the leading seed frame).
-            latents[:, :, input_start + 1 : span.end] = chunk_latents[:, :, 1:]
+            # Clean-sigma state-save pass (upstream ``save_kv_cache=True``): one
+            # forward over the settled chunk at timestep 0, capturing the terminal
+            # GDN state to seed the next chunk. Skipped after the final chunk.
+            if span.index + 1 < len(spans):
+                clean_timestep = torch.zeros(1, 1, cam_frames, device=device, dtype=torch.float32)
+                clean_pos = step_state(adapter, is_first_chunk=span.is_first, capture=True, is_negative=False)
+                self.transformer(
+                    chunk_latents,
+                    clean_timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    encoder_attention_mask=prompt_attention_mask,
+                    plucker=chunk_plucker,
+                    raymap=chunk_raymap,
+                    spatial_raymap=chunk_spatial,
+                    gdn_state=clean_pos,
+                )
+                commit_chunk_state(adapter, clean_pos, is_negative=False)
+                if do_cfg:
+                    clean_neg = step_state(adapter, is_first_chunk=span.is_first, capture=True, is_negative=True)
+                    self.transformer(
+                        chunk_latents,
+                        clean_timestep,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_attention_mask=negative_prompt_attention_mask,
+                        plucker=chunk_plucker,
+                        raymap=chunk_raymap,
+                        spatial_raymap=chunk_spatial,
+                        gdn_state=clean_neg,
+                    )
+                    commit_chunk_state(adapter, clean_neg, is_negative=True)
+
             adapter.chunk_index = span.index + 1
 
         output_type = str(extra_args.get("sana_wm_output_type", "latent"))
