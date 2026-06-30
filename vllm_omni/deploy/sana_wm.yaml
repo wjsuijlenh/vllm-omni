@@ -1,0 +1,43 @@
+# SANA-WM I2V deploy: single-stage (Stage-1 DiT + LTX-2 refiner, native smoke path).
+#
+# model_class_name must be set here because the SANA-WM HF repo has no
+# model_index.json; data.py detects the layout heuristically but allows the
+# yaml to override.  skip_mm_profiling is required because diffusion_engine.py
+# skips dummy_run for SanaWmTwoStagesPipeline.
+#
+# default_sampling_params mirror the NVlabs-recommended production inference
+# config. See docs/user_guide/examples/online_serving/sana_wm.md and
+# recipes/Efficient-Large-Model/SANA-WM.md for launch and request examples:
+#   num_frames=161 (10 s @ 16 fps), num_inference_steps=60, guidance_scale=5.0,
+#   seed=42, fps=16. CFG=5.0 is the real production knob; the native pipeline
+#   now honors guidance_scale via the §6.14u CFG implementation. Callers can
+#   override any of these per-request; defaults apply only when unset.
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    skip_mm_profiling: true
+    devices: "0"
+    engine_args:
+      model_class_name: "SanaWmTwoStagesPipeline"
+    default_sampling_params:
+      seed: 42
+      height: 704
+      width: 1280
+      num_frames: 161
+      fps: 16
+      num_inference_steps: 60
+      guidance_scale: 5.0
+      # Run the LTX-2 refiner so /v1/videos returns decoded RGB frames rather
+      # than a raw Stage-1 latent. Redundant with the two-stage default, but
+      # makes the production serving intent explicit.
+      extra_args:
+        sana_wm_inprocess_refiner: true
+        # 3 = the full LTX-2 distilled Stage-2 sigma schedule
+        # (0.909 -> 0.725 -> 0.422 -> 0.0), matching NVlabs
+        # diffusion/refiner/diffusers_ltx2_refiner.py (num_inference_steps=3).
+        # Fewer steps stop before sigma=0 and decode to noise.
+        sana_wm_inprocess_refiner_steps: 3
