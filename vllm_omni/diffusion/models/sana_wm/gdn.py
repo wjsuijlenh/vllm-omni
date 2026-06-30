@@ -233,11 +233,17 @@ def fused_bigdn_func(
     S: int,
     k_scale: float,
     eps: float = 1e-6,
-) -> torch.Tensor:
+    init_state_kv: torch.Tensor | None = None,
+    init_state_z: torch.Tensor | None = None,
+    return_final_state: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bidirectional fused GDN. Returns ``(B, N, H, D)``.
 
     Thin entry point kept for call-site stability; delegates to
-    :func:`fused_bigdn_bidi_chunkwise` from ``fused_gdn_chunkwise``.
+    :func:`fused_bigdn_bidi_chunkwise` from ``fused_gdn_chunkwise``. For
+    autoregressive decoding, ``init_state_kv``/``init_state_z`` seed the forward
+    scan and ``return_final_state`` additionally returns the carryable
+    ``(state_kv, state_z)`` (the chunkwise op already supports this contract).
     """
 
     return fused_bigdn_bidi_chunkwise(
@@ -254,6 +260,9 @@ def fused_bigdn_func(
         S=S,
         k_scale=k_scale,
         eps=eps,
+        init_state_kv=init_state_kv,
+        init_state_z=init_state_z,
+        return_final_state=return_final_state,
     )
 
 
@@ -1872,7 +1881,19 @@ def _delta_scan(
     decay: torch.Tensor,
     *,
     spatial_tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    init_state_kv: torch.Tensor | None = None,
+    init_state_z: torch.Tensor | None = None,
+    return_final_state: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Forward gated-delta recurrence over frames.
+
+    When ``init_state_kv``/``init_state_z`` are given the scan seeds from them
+    instead of zeros (autoregressive carry across chunks); with
+    ``return_final_state`` it also returns the terminal ``(state_kv, state_z)``
+    so the next chunk can resume. The recurrence is exact across a split point:
+    scanning ``[a; b]`` in one pass equals scanning ``a`` then seeding ``b`` with
+    ``a``'s final state.
+    """
     batch_size, num_heads, head_dim, token_count = query.shape
     frames = beta.shape[2]
 
@@ -1884,8 +1905,21 @@ def _delta_scan(
     value_f = to_frames(value)
     query_rot_f = to_frames(query_rot)
     key_rot_f = to_frames(key_rot)
-    state_kv = torch.zeros(batch_size, num_heads, head_dim, head_dim, device=query.device, dtype=query.dtype)
-    state_z = torch.zeros(batch_size, num_heads, head_dim, 1, device=query.device, dtype=query.dtype)
+    if init_state_kv is None:
+        state_kv = torch.zeros(batch_size, num_heads, head_dim, head_dim, device=query.device, dtype=query.dtype)
+    else:
+        if init_state_kv.shape != (batch_size, num_heads, head_dim, head_dim):
+            raise ValueError(
+                f"init_state_kv shape {tuple(init_state_kv.shape)} != "
+                f"{(batch_size, num_heads, head_dim, head_dim)}."
+            )
+        state_kv = init_state_kv.to(device=query.device, dtype=query.dtype)
+    if init_state_z is None:
+        state_z = torch.zeros(batch_size, num_heads, head_dim, 1, device=query.device, dtype=query.dtype)
+    else:
+        if init_state_z.shape != (batch_size, num_heads, head_dim, 1):
+            raise ValueError(f"init_state_z shape {tuple(init_state_z.shape)} != {(batch_size, num_heads, head_dim, 1)}.")
+        state_z = init_state_z.to(device=query.device, dtype=query.dtype)
     numerators: list[torch.Tensor] = []
     denominators: list[torch.Tensor] = []
 
@@ -1915,6 +1949,8 @@ def _delta_scan(
         stacked = torch.stack(tensors, dim=2)
         return stacked.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, dim, token_count)
 
+    if return_final_state:
+        return restore(numerators, head_dim), restore(denominators, 1), state_kv, state_z
     return restore(numerators, head_dim), restore(denominators, 1)
 
 
@@ -1938,12 +1974,24 @@ def reference_bidirectional_gated_delta_net(
     query_rot: torch.Tensor | None = None,
     key_rot: torch.Tensor | None = None,
     eps: float = 1e-8,
-) -> torch.Tensor:
+    init_state_kv: torch.Tensor | None = None,
+    init_state_z: torch.Tensor | None = None,
+    return_final_state: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the SANA-WM bidirectional gated delta recurrence in PyTorch.
 
     Inputs follow the layout used by the official Stage-1 operator:
     ``query/key/value/query_rot/key_rot`` are ``[B, H, D, T*S]``, ``beta`` is
     ``[B, H, T, S]``, and ``decay`` is ``[B, H, T]``.
+
+    For autoregressive (chunk-causal) decoding, ``init_state_kv``/``init_state_z``
+    seed the **forward** scan from the previous chunk's terminal state; the
+    reverse scan always restarts from zero (the upstream chunk-causal convention,
+    so future context stays bounded to the current chunk). With
+    ``return_final_state`` the function also returns the forward scan's terminal
+    ``(state_kv, state_z)`` (fp32) to carry into the next chunk. This mirrors the
+    fused kernel's ``init_state_*`` / ``return_final_state`` contract so the
+    reference and Triton paths agree.
     """
 
     batch_size, num_heads, head_dim, token_count, frames = _validate_gdn_inputs(
@@ -1965,7 +2013,9 @@ def reference_bidirectional_gated_delta_net(
     beta = beta.float()
     decay = decay.float()
 
-    num_fwd, den_fwd = _delta_scan(
+    fwd_init_kv = init_state_kv.float() if init_state_kv is not None else None
+    fwd_init_z = init_state_z.float() if init_state_z is not None else None
+    fwd = _delta_scan(
         query,
         key,
         value,
@@ -1974,7 +2024,14 @@ def reference_bidirectional_gated_delta_net(
         beta,
         decay,
         spatial_tokens=spatial_tokens,
+        init_state_kv=fwd_init_kv,
+        init_state_z=fwd_init_z,
+        return_final_state=return_final_state,
     )
+    if return_final_state:
+        num_fwd, den_fwd, final_kv, final_z = fwd
+    else:
+        num_fwd, den_fwd = fwd
 
     def to_time(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
@@ -2004,6 +2061,8 @@ def reference_bidirectional_gated_delta_net(
         return torch.flip(tensor, dims=[3]).reshape(batch_size, num_heads, dim, token_count)
 
     output = (num_fwd + flip_back(num_bwd_flipped)) / (den_fwd + flip_back(den_bwd_flipped) + eps)
+    if return_final_state:
+        return output.to(dtype_orig), final_kv, final_z
     return output.to(dtype_orig)
 
 
@@ -2027,7 +2086,10 @@ def triton_bidirectional_gated_delta_net_from_qkv(
     rotary_emb: torch.Tensor | None = None,
     k_scale: float,
     eps: float = 1e-8,
-) -> torch.Tensor:
+    init_state_kv: torch.Tensor | None = None,
+    init_state_z: torch.Tensor | None = None,
+    return_final_state: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the fused NVlabs bidirectional GDN kernel from raw QKV.
 
     Args:
@@ -2037,7 +2099,10 @@ def triton_bidirectional_gated_delta_net_from_qkv(
 
     Returns:
       Tensor shaped ``[B, H, D, N]`` to match
-      :func:`reference_bidirectional_gated_delta_net`.
+      :func:`reference_bidirectional_gated_delta_net`. When
+      ``return_final_state`` is set, returns ``(output, state_kv, state_z)`` with
+      ``state_kv`` ``[B, H, D, D]`` and ``state_z`` ``[B, H, D, 1]`` (the carryable
+      forward state for the next autoregressive chunk).
     """
 
     if _triton_disabled():
@@ -2075,7 +2140,7 @@ def triton_bidirectional_gated_delta_net_from_qkv(
     q_norm_weight = _rms_norm_weight(q_norm, hidden_size, device=qkv.device)
     k_norm_weight = _rms_norm_weight(k_norm, hidden_size, device=qkv.device)
     rope_cos, rope_sin = prepare_rope_tables(rotary_emb, token_count, head_dim, qkv.device)
-    output = fused_bigdn_func(
+    result = fused_bigdn_func(
         qkv,
         q_inv_rms,
         k_inv_rms,
@@ -2089,8 +2154,17 @@ def triton_bidirectional_gated_delta_net_from_qkv(
         S=spatial_tokens,
         k_scale=k_scale,
         eps=eps,
+        init_state_kv=init_state_kv,
+        init_state_z=init_state_z,
+        return_final_state=return_final_state,
     )
-    return output.permute(0, 2, 3, 1).contiguous()
+    if return_final_state:
+        assert isinstance(result, tuple)
+        output, state_kv, state_z = result
+        # output is (B, N, H, D); state_* are already (B, H, D, D)/(B, H, D, 1).
+        return output.permute(0, 2, 3, 1).contiguous(), state_kv, state_z
+    assert isinstance(result, torch.Tensor)
+    return result.permute(0, 2, 3, 1).contiguous()
 
 
 __all__ = [

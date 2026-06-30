@@ -15,6 +15,7 @@ import math
 import os
 import warnings
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from functools import reduce
 from operator import mul
 from typing import Any, ClassVar
@@ -593,6 +594,30 @@ class SanaWmCameraEmbedder(nn.Module):
         return hidden_states
 
 
+@dataclass
+class GdnArState:
+    """Per-forward carrier threading autoregressive GDN state through the blocks.
+
+    ``init`` maps a GDN block index to the ``(state_kv, state_z)`` that seeds that
+    block's forward scan; a missing entry means "seed from zeros" (the reset
+    chunk). ``final`` is filled during the forward with each GDN block's terminal
+    state so the rollout can commit it for the next chunk. ``capture`` requests
+    the terminal state from the scan; when it is ``False`` the GDN forward runs
+    exactly as the non-autoregressive path (no state plumbing observable).
+
+    Softmax blocks carry no recurrent state, so only GDN block indices appear
+    here -- matching ``SanaWmArStateAdapter.gdn_layers``.
+    """
+
+    init: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    final: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    capture: bool = True
+
+    def seed_for(self, block_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        seed = self.init.get(block_idx)
+        return (None, None) if seed is None else seed
+
+
 class SanaWmSelfAttention(nn.Module):
     def __init__(
         self,
@@ -920,19 +945,29 @@ class SanaWmSelfAttention(nn.Module):
         rotary_emb: torch.Tensor | None,
         *,
         precomputed_gates: tuple[torch.Tensor, torch.Tensor] | None = None,
+        gdn_state: GdnArState | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Run main-branch bidirectional GDN and return the (B, N, q_size)
         raw output BEFORE ``output_gate`` and ``proj`` are applied.
 
         Returns ``(raw_output, (beta, decay))`` so the caller can share the
         beta/decay gates with the camera branch (matches NVlabs' shared
-        ``precomputed_gates`` plumbing).
+        ``precomputed_gates`` plumbing). When ``gdn_state`` is given, this block's
+        forward scan is seeded from ``gdn_state.init`` and its terminal state is
+        recorded into ``gdn_state.final`` (autoregressive chunk carry).
         """
         batch_size, token_count, _hidden_size = hidden_states.shape
         frames, height, width = spatial_shape
         spatial_tokens = height * width
         if token_count != frames * spatial_tokens:
             raise ValueError(f"Sana-WM GDN expects N=T*H*W, got N={token_count}, THW={spatial_shape}.")
+
+        block_idx = getattr(self, "block_idx", 0)
+        init_kv = init_z = None
+        capture = False
+        if gdn_state is not None:
+            capture = gdn_state.capture
+            init_kv, init_z = gdn_state.seed_for(block_idx)
 
         qkv = _linear_output(self.qkv(hidden_states))
         q_size = self.num_heads * self.head_dim
@@ -955,7 +990,7 @@ class SanaWmSelfAttention(nn.Module):
                 dim=2,
             )
             try:
-                output = triton_bidirectional_gated_delta_net_from_qkv(
+                fused = triton_bidirectional_gated_delta_net_from_qkv(
                     qkv,
                     beta=beta,
                     decay=decay,
@@ -965,7 +1000,17 @@ class SanaWmSelfAttention(nn.Module):
                     rotary_emb=rotary_emb,
                     k_scale=(self.head_dim**-0.5) * (spatial_tokens**-0.5),
                     eps=self.eps,
+                    init_state_kv=init_kv,
+                    init_state_z=init_z,
+                    return_final_state=capture,
                 )
+                if capture:
+                    assert isinstance(fused, tuple) and gdn_state is not None
+                    output, final_kv, final_z = fused
+                    gdn_state.final[block_idx] = (final_kv, final_z)
+                else:
+                    assert isinstance(fused, torch.Tensor)
+                    output = fused
                 output = output.permute(0, 3, 1, 2).reshape(batch_size, token_count, q_size)
                 return output, (beta, decay)
             except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
@@ -999,7 +1044,7 @@ class SanaWmSelfAttention(nn.Module):
             query_rot = query
             key_rot = key
 
-        output = reference_bidirectional_gated_delta_net(
+        ref = reference_bidirectional_gated_delta_net(
             query,
             key,
             value,
@@ -1009,7 +1054,17 @@ class SanaWmSelfAttention(nn.Module):
             query_rot=query_rot,
             key_rot=key_rot,
             eps=self.eps,
+            init_state_kv=init_kv,
+            init_state_z=init_z,
+            return_final_state=capture,
         )
+        if capture:
+            assert isinstance(ref, tuple) and gdn_state is not None
+            output, final_kv, final_z = ref
+            gdn_state.final[block_idx] = (final_kv, final_z)
+        else:
+            assert isinstance(ref, torch.Tensor)
+            output = ref
         output = output.permute(0, 3, 1, 2).reshape(batch_size, token_count, q_size)
         return output, (beta, decay)
 
@@ -1059,9 +1114,10 @@ class SanaWmSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         spatial_shape: tuple[int, int, int],
         rotary_emb: torch.Tensor | None,
+        gdn_state: GdnArState | None = None,
     ) -> torch.Tensor:
         """Main-branch only GDN forward with output_gate + proj applied."""
-        raw, _ = self._forward_gdn_raw(hidden_states, spatial_shape, rotary_emb)
+        raw, _ = self._forward_gdn_raw(hidden_states, spatial_shape, rotary_emb, gdn_state=gdn_state)
         return self._apply_output_gate_and_proj(raw, hidden_states)
 
     def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -1509,6 +1565,7 @@ class SanaWmSelfAttention(nn.Module):
         spatial_shape: tuple[int, int, int] | None = None,
         rotary_emb: torch.Tensor | None = None,
         camera_conditions: torch.Tensor | None = None,
+        gdn_state: GdnArState | None = None,
     ) -> torch.Tensor:
         """Forward with dual-branch GDN+UCPE when ``camera_conditions`` is
         provided, otherwise main-branch-only GDN or softmax fallback.
@@ -1523,15 +1580,18 @@ class SanaWmSelfAttention(nn.Module):
             if camera_conditions is None or self.q_proj_cam is None:
                 # Main branch only — preserves legacy path when the request
                 # has no camera info or the cam projections were not built.
-                return self._forward_gdn(hidden_states, spatial_shape, rotary_emb)
+                return self._forward_gdn(hidden_states, spatial_shape, rotary_emb, gdn_state)
             # Dual-branch: precompute β/decay once, run main raw, cam raw,
             # combine, then apply shared output_gate + proj exactly once.
+            # The camera branch is stateless (cam_scan carries no state), so only
+            # the main branch threads gdn_state.
             beta, decay = self._compute_frame_gates(hidden_states, spatial_shape)
             main_raw, _ = self._forward_gdn_raw(
                 hidden_states,
                 spatial_shape,
                 rotary_emb,
                 precomputed_gates=(beta, decay),
+                gdn_state=gdn_state,
             )
             cam_raw = self._forward_cam_branch(
                 hidden_states,
@@ -1855,6 +1915,7 @@ class SanaWmBlock(nn.Module):
         camera_hidden_states: torch.Tensor | None = None,
         camera_conditions: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
+        gdn_state: GdnArState | None = None,
     ) -> torch.Tensor:
         # NVlabs dispatch convention: when timestep
         # modulation carries a frame axis (ndim > 2), route through the
@@ -1869,13 +1930,14 @@ class SanaWmBlock(nn.Module):
                 camera_hidden_states,
                 camera_conditions,
                 encoder_attention_mask,
+                gdn_state,
             )
         batch_size = hidden_states.shape[0]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.scale_shift_table[None] + timestep_modulation.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
         attn_input = self._modulate(self.norm1(hidden_states), shift_msa, scale_msa)
-        attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_conditions)
+        attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_conditions, gdn_state)
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         hidden_states = hidden_states + gate_msa * attn_output
@@ -1898,6 +1960,7 @@ class SanaWmBlock(nn.Module):
         camera_hidden_states: torch.Tensor | None,
         camera_conditions: torch.Tensor | None,
         encoder_attention_mask: torch.Tensor | None = None,
+        gdn_state: GdnArState | None = None,
     ) -> torch.Tensor:
         """Per-frame timestep modulation path matching NVlabs
         ``SanaVideoMSCamCtrlBlock.forward_frame_aware``.
@@ -1928,7 +1991,7 @@ class SanaWmBlock(nn.Module):
         # scale/shift over the spatial axis, then flattening back.
         x_norm1 = self.norm1(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_msa_in = (x_norm1 * (1 + scale_msa) + shift_msa).reshape(batch_size, token_count, hidden_size)
-        attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, camera_conditions)
+        attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, camera_conditions, gdn_state)
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         attn_output_4d = attn_output.reshape(batch_size, frames, spatial_tokens, hidden_size)
@@ -2258,6 +2321,7 @@ class SanaWmTransformer3DModel(nn.Module):
         plucker: torch.Tensor | None = None,
         raymap: torch.Tensor | None = None,
         spatial_raymap: torch.Tensor | None = None,
+        gdn_state: GdnArState | None = None,
     ) -> torch.Tensor:
         if hidden_states.ndim != 5:
             raise ValueError("Sana-WM transformer expects latent input shaped [B, C, F, H, W].")
@@ -2388,6 +2452,7 @@ class SanaWmTransformer3DModel(nn.Module):
                 camera_hidden_states,
                 camera_conditions,
                 encoder_attention_mask,
+                gdn_state,
             )
 
         hidden_states = self.final_layer(hidden_states, time_embed.to(hidden_states.dtype), spatial_shape)
