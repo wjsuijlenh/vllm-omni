@@ -967,6 +967,46 @@ def _phase_b_kernel(
                     tl.store(z_rev_ptr + bh * F * BLOCK_D + f_dst * BLOCK_D + offs_d, z)
 
 
+def _seed_init_state(
+    init_state_kv: torch.Tensor,
+    init_state_z: torch.Tensor,
+    *,
+    bh: int,
+    block_d: int,
+    device: torch.device,
+    fdtype: torch.dtype,
+    dummy: torch.Tensor,
+    skip_z: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert a carried forward state to phase B's padded, un-transposed layout.
+
+    ``fused_bigdn_bidi_chunkwise`` returns the terminal forward state in canonical
+    ``(B, H, D, D)`` / ``(B, H, D, 1)`` form -- sliced from the padded ``BLOCK_D``
+    square and transposed. Phase B's scan seeds from the raw
+    ``(BH, BLOCK_D, BLOCK_D)`` / ``(BH, BLOCK_D)`` buffers, so to re-feed a saved
+    state (autoregressive chunk > 0) we invert that: un-transpose and zero-pad
+    ``D -> BLOCK_D``. Input already in raw padded layout is accepted as-is.
+    """
+    kv = init_state_kv.contiguous()
+    if kv.numel() == bh * block_d * block_d:
+        init_kv = kv.view(bh, block_d, block_d).to(fdtype)
+    else:
+        d = kv.shape[-1]
+        canon = kv.reshape(bh, d, d).to(fdtype)
+        init_kv = torch.zeros(bh, block_d, block_d, device=device, dtype=fdtype)
+        init_kv[:, :d, :d] = canon.transpose(-1, -2)  # inverse of the output transpose
+    if skip_z:
+        return init_kv, dummy
+    z = init_state_z.contiguous()
+    if z.numel() == bh * block_d:
+        init_z = z.view(bh, block_d).to(fdtype)
+    else:
+        dz = z.numel() // bh
+        init_z = torch.zeros(bh, block_d, device=device, dtype=fdtype)
+        init_z[:, :dz] = z.reshape(bh, dz).to(fdtype)
+    return init_kv, init_z
+
+
 def phase_b_triton(
     I_P_kv,
     A,
@@ -1044,8 +1084,16 @@ def phase_b_triton(
     M_rev = dummy if (direction == 1 or combined_history) else full_M()
     z_rev = dummy if (direction == 1 or combined_history or skip_z) else full_z()
     if load_init:
-        init_kv = init_state_kv.contiguous().view(BH, BLOCK_D, BLOCK_D)
-        init_z = dummy if skip_z else init_state_z.contiguous().view(BH, BLOCK_D)
+        init_kv, init_z = _seed_init_state(
+            init_state_kv,
+            init_state_z,
+            bh=BH,
+            block_d=BLOCK_D,
+            device=device,
+            fdtype=fdtype,
+            dummy=dummy,
+            skip_z=skip_z,
+        )
     else:
         init_kv = dummy
         init_z = dummy
