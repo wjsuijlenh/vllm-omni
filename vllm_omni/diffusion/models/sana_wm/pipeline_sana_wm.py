@@ -26,6 +26,14 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.sana_wm.ar_rollout import (
+    FIRST_CHUNK_PLUS_ONE,
+    ChunkSpan,
+    commit_chunk_state,
+    plan_chunks,
+    slice_camera_frames,
+    step_state,
+)
 from vllm_omni.diffusion.models.sana_wm.camera_control import (
     SanaWmCameraCondition,
     build_plucker_condition,
@@ -43,6 +51,8 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.experimental.world_models.adapters.state_sana_wm_ar_adapter import SanaWmArStateAdapter
+from vllm_omni.experimental.world_models.memory import SessionMemoryManager
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.stage_input_processors.sana_wm import normalize_sana_wm_payload
 
@@ -670,6 +680,12 @@ class SanaWmPipeline(
         payload: dict[str, Any],
         sampling_params: Any | None,
     ) -> DiffusionOutput:
+        extra_args_dispatch = self._extra_args(sampling_params)
+        if int(extra_args_dispatch.get("sana_wm_ar_chunk_size", 0)) > 0:
+            # Opt-in autoregressive chunk rollout (chunk-causal checkpoint). The
+            # default bidirectional path below is unchanged.
+            return self._run_native_backend_ar(prompt=prompt, payload=payload, sampling_params=sampling_params)
+
         params = self._native_params(payload, sampling_params)
         latent_frames = (params.num_frames - 1) // 8 + 1
         latent_height = max(params.height // 32, 1)
@@ -888,6 +904,218 @@ class SanaWmPipeline(
                 "sana_wm_height": params.height,
                 "sana_wm_width": params.width,
                 "sana_wm_latent_tokens": token_count,
+                "sana_wm_sampling_steps": params.num_inference_steps,
+            },
+        )
+
+    def _ar_session_manager(self) -> SessionMemoryManager:
+        """Lazily-created, cross-request session-memory manager for AR rollouts."""
+        manager = getattr(self, "_ar_session_manager_obj", None)
+        if manager is None:
+            manager = SessionMemoryManager()
+            self._ar_session_manager_obj = manager
+        return manager
+
+    def _run_native_backend_ar(
+        self,
+        *,
+        prompt: dict[str, Any],
+        payload: dict[str, Any],
+        sampling_params: Any | None,
+    ) -> DiffusionOutput:
+        """Autoregressive chunk rollout for the chunk-causal SANA-WM checkpoint.
+
+        Generates the clip chunk-by-chunk, carrying each Gated-DeltaNet block's
+        fixed-size recurrent state across chunks through the shared
+        ``SessionMemoryManager`` (RFC #4480) via ``SanaWmArStateAdapter`` and the
+        ``GdnArState`` carrier. The state seed/capture/commit sequencing is the
+        ``ar_rollout`` orchestration (CPU-tested); this method supplies the
+        denoise loop, latent assembly, and per-chunk camera slicing.
+
+        Frame composition: chunk 0 spans frames ``[0, chunk_size+1)`` with frame 0
+        the image-conditioning latent; each later chunk prepends the previous
+        chunk's last (settled) frame as a read-only conditioning frame and
+        generates ``chunk_size`` new frames. Only the generated frames are written
+        back. The GDN scan resumes from the carried state on every chunk after the
+        first.
+
+        NOTE: this path is numerically validated against the upstream chunk-causal
+        checkpoint on GPU (the equivalence step), not on CPU. The exact
+        ``first_chunk_plus_one`` composition above is the release-config reading
+        and is confirmed there.
+        """
+        params = self._native_params(payload, sampling_params)
+        extra_args = self._extra_args(sampling_params)
+        chunk_size = int(extra_args.get("sana_wm_ar_chunk_size", 0))
+        if chunk_size <= 0:
+            raise ValueError("AR rollout requires sana_wm_ar_chunk_size > 0.")
+
+        latent_frames = (params.num_frames - 1) // 8 + 1
+        latent_height = max(params.height // 32, 1)
+        latent_width = max(params.width // 32, 1)
+        token_count = latent_frames * latent_height * latent_width
+        max_tokens = int(extra_args.get("sana_wm_native_max_tokens", SANA_WM_NATIVE_MAX_TOKENS))
+        if token_count > max_tokens:
+            raise ValueError(
+                "Sana-WM native latent token count exceeds the configured cap. "
+                f"Requested latent tokens={token_count}, max={max_tokens}."
+            )
+
+        device, dtype = self._runtime_device_dtype()
+        generator = torch.Generator(device=device)
+        generator.manual_seed(params.seed)
+        noise = torch.randn(
+            (1, 128, latent_frames, latent_height, latent_width), device=device, dtype=dtype, generator=generator
+        )
+
+        import numpy as _np
+
+        first_frame_image = (prompt.get("multi_modal_data") or {}).get("image")
+        is_image = first_frame_image is not None and (
+            hasattr(first_frame_image, "convert") or isinstance(first_frame_image, (_np.ndarray, torch.Tensor))
+        )
+        if not is_image:
+            # The AR rollout seeds every chunk from a clean prior frame; chunk 0's
+            # seed is the image-conditioning latent, so a first frame is required.
+            raise ValueError("Sana-WM AR rollout requires a first-frame image to seed frame 0.")
+        first_latent = self._vae_encode_first_frame(
+            first_frame_image,
+            height=params.height,
+            width=params.width,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            device=device,
+            dtype=dtype,
+        )
+        latents = torch.cat([first_latent, noise[:, :, 1:]], dim=2)
+
+        scheduler = SanaWmFlowMatchScheduler(params.num_inference_steps, shift=self.sana_wm_config.inference_flow_shift)
+        timesteps = scheduler.timesteps(device=device)
+        num_steps = len(timesteps)
+
+        allow_hash_fallback = bool(extra_args.get("sana_wm_hash_prompt_fallback", False))
+        prompt_embeds, prompt_source = self._native_prompt_embeds(
+            prompt, device=device, dtype=dtype, allow_hash_fallback=allow_hash_fallback
+        )
+        prompt_attention_mask = self._last_prompt_attention_mask
+        do_cfg = params.cfg_scale > 1.0
+        if do_cfg:
+            negative_prompt_embeds, _ = self._native_prompt_embeds(
+                {"prompt": params.negative_prompt}, device=device, dtype=dtype, allow_hash_fallback=allow_hash_fallback
+            )
+            negative_prompt_attention_mask = self._last_prompt_attention_mask
+            self._last_prompt_attention_mask = prompt_attention_mask
+        else:
+            negative_prompt_embeds = None
+            negative_prompt_attention_mask = None
+
+        camera = payload.get("camera") or {}
+        condition = SanaWmCameraCondition(
+            poses=camera.get("poses") if isinstance(camera, dict) else None,
+            intrinsics=payload.get("intrinsics"),
+            action=payload.get("action"),
+            num_frames=params.num_frames,
+            height=params.height,
+            width=params.width,
+            translation_speed=float(payload.get("translation_speed", 0.05)),
+            rotation_speed_deg=float(payload.get("rotation_speed_deg", 1.2)),
+        )
+        camera_tensors = build_plucker_condition(condition)
+        plucker = camera_tensors["chunk_plucker"].to(device=device, dtype=dtype)  # (C, T, H, W)
+        raymap = camera_tensors["raymap"].to(device=device, dtype=dtype)  # (T, 20)
+        spatial_raymap = camera_tensors.get("spatial_raymap")  # (3, T, H, W)
+        if spatial_raymap is not None:
+            spatial_raymap = spatial_raymap.to(device=device, dtype=dtype)
+
+        self.transformer.config = self.sana_wm_config
+
+        session_id = str(payload.get("session_id") or "sana-wm-ar")
+        adapter = SanaWmArStateAdapter.from_config(session_id, self._ar_session_manager(), self.sana_wm_config)
+        adapter.reset()
+        adapter.create_state(1, dtype, device)
+
+        spans = plan_chunks(latent_frames, chunk_size, FIRST_CHUNK_PLUS_ONE)
+        for span in spans:
+            # Input range includes one leading conditioning frame: the image for
+            # chunk 0, the previous chunk's last settled frame otherwise.
+            input_start = span.start if span.is_first else span.start - 1
+            input_span = ChunkSpan(index=span.index, start=input_start, end=span.end)
+            chunk_latents = latents[:, :, input_start : span.end].contiguous()
+            cam_frames = input_span.num_frames
+
+            chunk_plucker = slice_camera_frames(plucker, input_span, frame_dim=1)
+            chunk_raymap = slice_camera_frames(raymap, input_span, frame_dim=0)
+            chunk_spatial = slice_camera_frames(spatial_raymap, input_span, frame_dim=1)
+
+            # Frame 0 of the chunk is the clean conditioning/seed frame, held at 0.
+            condition_mask = torch.zeros(1, 1, cam_frames, 1, 1, device=device, dtype=dtype)
+            condition_mask[:, :, 0] = 1.0
+
+            for step_idx, timestep in enumerate(timesteps):
+                capture = step_idx == num_steps - 1
+                model_timestep = timestep.float().expand(1, 1, cam_frames).clone()
+                model_timestep[:, :, 0] = 0.0
+
+                pos_state = step_state(adapter, is_first_chunk=span.is_first, capture=capture, is_negative=False)
+                noise_pred_cond = self.transformer(
+                    chunk_latents,
+                    model_timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    encoder_attention_mask=prompt_attention_mask,
+                    plucker=chunk_plucker,
+                    raymap=chunk_raymap,
+                    spatial_raymap=chunk_spatial,
+                    gdn_state=pos_state,
+                )
+                if do_cfg:
+                    neg_state = step_state(adapter, is_first_chunk=span.is_first, capture=capture, is_negative=True)
+                    noise_pred_uncond = self.transformer(
+                        chunk_latents,
+                        model_timestep,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_attention_mask=negative_prompt_attention_mask,
+                        plucker=chunk_plucker,
+                        raymap=chunk_raymap,
+                        spatial_raymap=chunk_spatial,
+                        gdn_state=neg_state,
+                    )
+                    noise_pred = noise_pred_uncond + params.cfg_scale * (noise_pred_cond - noise_pred_uncond)
+                else:
+                    neg_state = None
+                    noise_pred = noise_pred_cond
+
+                pt_t = (
+                    model_timestep.unsqueeze(-1)
+                    .unsqueeze(-1)
+                    .expand(1, 1, cam_frames, chunk_latents.shape[3], chunk_latents.shape[4])
+                    .reshape(1, -1)
+                )
+                stepped = scheduler.step_flow_euler_per_token(noise_pred, timestep, chunk_latents, pt_t)
+                tokens_to_denoise_mask = timestep / float(scheduler.num_train_timesteps) - 1e-6 < (1.0 - condition_mask)
+                chunk_latents = torch.where(tokens_to_denoise_mask, stepped, chunk_latents)
+
+                if capture:
+                    commit_chunk_state(adapter, pos_state, is_negative=False)
+                    if neg_state is not None:
+                        commit_chunk_state(adapter, neg_state, is_negative=True)
+
+            # Write back only the generated frames (skip the leading seed frame).
+            latents[:, :, input_start + 1 : span.end] = chunk_latents[:, :, 1:]
+            adapter.chunk_index = span.index + 1
+
+        output_type = str(extra_args.get("sana_wm_output_type", "latent"))
+        output = self._decode_native_latents(latents, output_type=output_type, device=device, dtype=dtype)
+        return DiffusionOutput(
+            output=output,
+            custom_output={
+                "sana_wm_backend": "native_gdn_ar",
+                "sana_wm_output_space": output_type,
+                "sana_wm_prompt_source": prompt_source,
+                "sana_wm_first_frame_encoded": is_image,
+                "sana_wm_num_frames": params.num_frames,
+                "sana_wm_latent_tokens": token_count,
+                "sana_wm_ar_chunk_size": chunk_size,
+                "sana_wm_ar_chunks": len(spans),
                 "sana_wm_sampling_steps": params.num_inference_steps,
             },
         )

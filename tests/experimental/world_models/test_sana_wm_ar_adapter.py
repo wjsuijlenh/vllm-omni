@@ -125,6 +125,18 @@ def test_gdn_layers_are_isolated() -> None:
         torch.testing.assert_close(adapter.get_gdn_state(layer)["state_kv"], kv)
 
 
+def test_gdn_state_cfg_branches_isolated() -> None:
+    # The cond/uncond GDN recurrences are independent; their state must not alias.
+    adapter = _created()
+    pos_kv, pos_z = _gdn_payload()
+    neg_kv, neg_z = _gdn_payload()
+    adapter.commit_gdn_state(0, pos_kv, pos_z, is_negative=False)
+    adapter.commit_gdn_state(0, neg_kv, neg_z, is_negative=True)
+    torch.testing.assert_close(adapter.get_gdn_state(0, is_negative=False)["state_kv"], pos_kv)
+    torch.testing.assert_close(adapter.get_gdn_state(0, is_negative=True)["state_kv"], neg_kv)
+    assert not torch.allclose(pos_kv, neg_kv)
+
+
 def test_softmax_kv_branches_isolated() -> None:
     adapter = _created()
     for layer in SOFTMAX_LAYERS:

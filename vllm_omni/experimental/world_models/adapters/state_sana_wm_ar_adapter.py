@@ -59,8 +59,11 @@ _STATE_KV = "state_kv"
 _STATE_Z = "state_z"
 
 
-def _gdn_key(layer_index: int) -> str:
-    return f"{_GDN_KEY}/{layer_index}"
+def _gdn_key(layer_index: int, is_negative: bool = False) -> str:
+    # GDN recurrent state is per CFG branch: the cond and uncond passes are
+    # independent sequences, each with its own forward recurrence across chunks.
+    branch = "neg" if is_negative else "pos"
+    return f"{_GDN_KEY}/{branch}/{layer_index}"
 
 
 def _softmax_kv_key(layer_index: int, is_negative: bool) -> str:
@@ -165,13 +168,14 @@ class SanaWmArStateAdapter:
         session = self._session
         h, d = self._num_heads, self._head_dim
         for layer in self._gdn_layers:
-            state = FixedState()
-            state.allocate(
-                shapes={_STATE_KV: (batch_size, h, d, d), _STATE_Z: (batch_size, h, d, 1)},
-                dtype=dtype,
-                device=device,
-            )
-            session.put(_gdn_key(layer), state)
+            for is_neg in (False, True):
+                state = FixedState()
+                state.allocate(
+                    shapes={_STATE_KV: (batch_size, h, d, d), _STATE_Z: (batch_size, h, d, 1)},
+                    dtype=dtype,
+                    device=device,
+                )
+                session.put(_gdn_key(layer, is_neg), state)
 
         for layer in self._softmax_layers:
             for is_neg in (False, True):
@@ -194,21 +198,23 @@ class SanaWmArStateAdapter:
 
     # -- GDN recurrent state --------------------------------------------
 
-    def get_gdn_state(self, layer_index: int) -> dict[str, torch.Tensor]:
-        """Return the live ``{state_kv, state_z}`` for a GDN block.
+    def get_gdn_state(self, layer_index: int, is_negative: bool = False) -> dict[str, torch.Tensor]:
+        """Return the live ``{state_kv, state_z}`` for a GDN block / CFG branch.
 
         On the reset chunk (``chunk_index == 0``) these are zeros and the caller
         should pass ``init_state=None`` to the scan; from chunk 1 on they hold the
         terminal forward state saved by the previous chunk.
         """
-        return self._gdn_object(layer_index).view()
+        return self._gdn_object(layer_index, is_negative).view()
 
-    def commit_gdn_state(self, layer_index: int, state_kv: torch.Tensor, state_z: torch.Tensor) -> None:
+    def commit_gdn_state(
+        self, layer_index: int, state_kv: torch.Tensor, state_z: torch.Tensor, is_negative: bool = False
+    ) -> None:
         """Overwrite a GDN block's recurrent state in place (end of a chunk)."""
-        self._gdn_object(layer_index).commit({_STATE_KV: state_kv, _STATE_Z: state_z})
+        self._gdn_object(layer_index, is_negative).commit({_STATE_KV: state_kv, _STATE_Z: state_z})
 
-    def _gdn_object(self, layer_index: int) -> FixedState:
-        obj = self._session.get(_gdn_key(layer_index))
+    def _gdn_object(self, layer_index: int, is_negative: bool = False) -> FixedState:
+        obj = self._session.get(_gdn_key(layer_index, is_negative))
         if not isinstance(obj, FixedState) or not obj.resident:
             raise RuntimeError(
                 f"GDN state for layer {layer_index} not initialized; call create_state first "
