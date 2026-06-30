@@ -20,6 +20,7 @@ from vllm_omni.experimental.world_models.memory.manager import (
 )
 from vllm_omni.experimental.world_models.memory.objects import (
     EncodeOnceKV,
+    FixedState,
     LatentBuffer,
     PagedKV,
 )
@@ -27,6 +28,7 @@ from vllm_omni.experimental.world_models.memory.objects import (
 __all__ = [
     "DEFAULT_MAX_SESSIONS",
     "EncodeOnceKV",
+    "FixedState",
     "LatentBuffer",
     "MemoryObject",
     "PagedKV",
