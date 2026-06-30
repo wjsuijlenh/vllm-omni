@@ -170,19 +170,25 @@ SM_B, SM_H, SM_D, SM_S = 1, 2, 4, 4  # batch, kv-heads, head_dim, spatial tokens
 
 class _StubSoftmaxStore:
     """Minimal softmax-KV store: holds one stacked ``(2, B, seq, H, D)`` per
-    (layer, branch), seq==0 when empty (the ``PagedKV`` layout the adapter uses)."""
+    (layer, branch, stream), seq==0 when empty (the ``PagedKV`` layout the adapter
+    uses). ``is_cam`` selects the main vs UCPE camera stream."""
 
     def __init__(self) -> None:
         self.softmax_layers = SM_LAYERS
         self._kv = {
-            (layer, neg): torch.zeros(2, SM_B, 0, SM_H, SM_D) for layer in SM_LAYERS for neg in (False, True)
+            (layer, neg, cam): torch.zeros(2, SM_B, 0, SM_H, SM_D)
+            for layer in SM_LAYERS
+            for neg in (False, True)
+            for cam in (False, True)
         }
 
-    def get_softmax_kv(self, layer_index: int, is_negative: bool = False) -> torch.Tensor:
-        return self._kv[(layer_index, is_negative)]
+    def get_softmax_kv(self, layer_index: int, is_negative: bool = False, is_cam: bool = False) -> torch.Tensor:
+        return self._kv[(layer_index, is_negative, is_cam)]
 
-    def commit_softmax_kv(self, layer_index: int, kv: torch.Tensor, is_negative: bool = False) -> None:
-        self._kv[(layer_index, is_negative)] = kv
+    def commit_softmax_kv(
+        self, layer_index: int, kv: torch.Tensor, is_negative: bool = False, is_cam: bool = False
+    ) -> None:
+        self._kv[(layer_index, is_negative, is_cam)] = kv
 
 
 def _chunk_kv(frame_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -242,12 +248,21 @@ def test_softmax_window_unbounded_keeps_full_history() -> None:
     assert _frame_ids_of(store.get_softmax_kv(3)) == [0.0, 1.0, 2.0, 3.0, 4.0]
 
 
-def test_commit_softmax_window_skips_cam_branch() -> None:
+def test_softmax_window_threads_both_main_and_cam_streams() -> None:
     store = _StubSoftmaxStore()
+    # Commit chunk 0 to BOTH streams with distinct frame tags.
     state = SoftmaxKvState(capture=True)
-    state.final[(3, True)] = _chunk_kv([0])  # cam branch entry -> ignored
+    state.final[(3, False)] = _chunk_kv([0, 1])  # main stream
+    state.final[(3, True)] = _chunk_kv([5, 6])  # cam stream (distinct tags)
     commit_softmax_window(store, state, spatial_tokens=SM_S, window_frames=4)
-    assert store.get_softmax_kv(3).shape[2] == 0  # nothing written
+
+    # The two streams are stored independently and never cross-contaminate.
+    assert _frame_ids_of(store.get_softmax_kv(3, is_cam=False)) == [0.0, 1.0]
+    assert _frame_ids_of(store.get_softmax_kv(3, is_cam=True)) == [5.0, 6.0]
+
+    # The next chunk's seed carries both streams.
+    seeded = softmax_step_state(store, is_first_chunk=False, capture=False)
+    assert (3, False) in seeded.init and (3, True) in seeded.init
 
 
 # -- camera slicing -------------------------------------------------------

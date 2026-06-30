@@ -65,9 +65,11 @@ class _SoftmaxKvStore(Protocol):
     @property
     def softmax_layers(self) -> tuple[int, ...]: ...
 
-    def get_softmax_kv(self, layer_index: int, is_negative: bool = ...) -> torch.Tensor: ...
+    def get_softmax_kv(self, layer_index: int, is_negative: bool = ..., is_cam: bool = ...) -> torch.Tensor: ...
 
-    def commit_softmax_kv(self, layer_index: int, kv: torch.Tensor, is_negative: bool = ...) -> None: ...
+    def commit_softmax_kv(
+        self, layer_index: int, kv: torch.Tensor, is_negative: bool = ..., is_cam: bool = ...
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -201,18 +203,21 @@ def softmax_step_state(
     The first chunk has no cached context (empty ``init``). Later chunks seed each
     softmax block from the windowed ``(key, value)`` the store accumulated from
     earlier chunks, converted from the ``PagedKV`` layout ``(2, B, seq, H, D)`` to
-    the per-branch ``(B, H, seq, D)`` the transformer prepends. ``capture`` should
-    be ``True`` only on the chunk's clean-sigma pass, so the recorded K/V belong
-    to the settled latent (mirroring the GDN carry).
+    the per-branch ``(B, H, seq, D)`` the transformer prepends. Both the main
+    self-attention stream (``is_cam=False``) and the UCPE camera stream
+    (``is_cam=True``) are seeded. ``capture`` should be ``True`` only on the
+    chunk's clean-sigma pass, so the recorded K/V belong to the settled latent
+    (mirroring the GDN carry).
     """
     init: dict[tuple[int, bool], tuple[torch.Tensor, torch.Tensor]] = {}
     if not is_first_chunk:
         for layer in store.softmax_layers:
-            kv = store.get_softmax_kv(layer, is_negative)  # (2, B, seq, H, D)
-            if kv.shape[2] > 0:
-                key = kv[0].permute(0, 2, 1, 3).contiguous()  # (B, H, seq, D)
-                value = kv[1].permute(0, 2, 1, 3).contiguous()
-                init[(layer, False)] = (key, value)
+            for is_cam in (False, True):
+                kv = store.get_softmax_kv(layer, is_negative, is_cam=is_cam)  # (2, B, seq, H, D)
+                if kv.shape[2] > 0:
+                    key = kv[0].permute(0, 2, 1, 3).contiguous()  # (B, H, seq, D)
+                    value = kv[1].permute(0, 2, 1, 3).contiguous()
+                    init[(layer, is_cam)] = (key, value)
     return SoftmaxKvState(init=init, capture=capture)
 
 
@@ -247,22 +252,20 @@ def commit_softmax_window(
 ) -> None:
     """Append a chunk's captured softmax K/V to the window and slide it forward.
 
-    For each cached softmax block the current chunk's ``(key, value)``
+    For each cached softmax stream -- the main self-attention branch and the UCPE
+    camera branch (``is_cam``) -- the current chunk's ``(key, value)``
     (``(B, H, N, D)``) is converted to the ``PagedKV`` layout, concatenated onto
-    the existing window along the token axis, trimmed by :func:`_evict_window`,
-    and written back. The ``is_cam`` camera branch is not windowed yet and is
-    skipped here.
+    the existing window along the token axis, trimmed by :func:`_evict_window`, and
+    written back to that stream's slot.
     """
     for (layer, is_cam), (key, value) in state.final.items():
-        if is_cam:
-            continue
         key_store = key.permute(0, 2, 1, 3)  # (B, N, H, D)
         value_store = value.permute(0, 2, 1, 3)
         new = torch.stack([key_store, value_store], dim=0)  # (2, B, N, H, D)
-        prev = store.get_softmax_kv(layer, is_negative)  # (2, B, seq, H, D); seq == 0 when empty
+        prev = store.get_softmax_kv(layer, is_negative, is_cam=is_cam)  # (2, B, seq, H, D); seq == 0 when empty
         combined = torch.cat([prev, new], dim=2) if prev.shape[2] > 0 else new
         kept = _evict_window(combined, spatial_tokens, window_frames, sink_frames)
-        store.commit_softmax_kv(layer, kept, is_negative)
+        store.commit_softmax_kv(layer, kept, is_negative, is_cam=is_cam)
 
 
 def slice_camera_frames(tensor: torch.Tensor | None, span: ChunkSpan, *, frame_dim: int) -> torch.Tensor | None:

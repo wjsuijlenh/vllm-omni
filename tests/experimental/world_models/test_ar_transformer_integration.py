@@ -31,6 +31,7 @@ from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
     GdnArState,
     SanaWmTransformer3DModel,
+    SoftmaxKvState,
 )
 from vllm_omni.experimental.world_models.adapters.state_sana_wm_ar_adapter import SanaWmArStateAdapter
 from vllm_omni.experimental.world_models.memory import SessionMemoryManager
@@ -155,3 +156,73 @@ def test_two_chunk_rollout_through_real_model(transformer: SanaWmTransformer3DMo
             lat1, 500.0, encoder_hidden_states=ehs, gdn_state=GdnArState(capture=False)
         )
     assert not torch.allclose(seeded, unseeded)
+
+
+# -- camera-enabled model: softmax sliding-window KV cache, both streams ----
+
+# The UCPE camera branch requires head_dim divisible by 8 and qk_norm weights, so
+# the camera tests use their own slightly larger fixture (the GDN tests above use
+# head_dim 4 / qk_norm off and never drive the camera branch).
+CAM_SOFTMAX_LAYER = 3
+
+
+def _cam_config() -> SanaWmConfig:
+    return SanaWmConfig(
+        num_blocks=4,
+        hidden_size=16,
+        linear_head_dim=8,  # -> 2 heads, head_dim 8 (UCPE-valid)
+        softmax_every_n=4,
+        conv_kernel_size=0,
+        qk_norm=True,
+        cam_attn_compress=1,
+        pos_embed_type="wan_rope",
+        patch_size=(1, 1, 1),
+        mlp_ratio=2.0,
+    )
+
+
+@pytest.fixture(scope="module")
+def cam_transformer() -> SanaWmTransformer3DModel:
+    torch.manual_seed(0)
+    with set_current_vllm_config(VllmConfig()):
+        model = SanaWmTransformer3DModel(config=_cam_config(), quant_config=None, prefix="transformer")
+    model.eval()
+    return model
+
+
+def _raymap(frames: int) -> torch.Tensor:
+    return torch.randn(1, frames, 20)
+
+
+def test_softmax_window_threads_both_streams_through_real_model(
+    cam_transformer: SanaWmTransformer3DModel,
+) -> None:
+    lat, ehs, raymap = _latents(2), _prompt(), _raymap(2)
+    with torch.no_grad():
+        base = cam_transformer(lat, 500.0, encoder_hidden_states=ehs, raymap=raymap)
+        state = SoftmaxKvState(capture=True)
+        out = cam_transformer(lat, 500.0, encoder_hidden_states=ehs, raymap=raymap, softmax_state=state)
+    # Non-invasive when not seeding, and finite.
+    torch.testing.assert_close(out, base)
+    assert torch.isfinite(base).all()
+    # The softmax block records BOTH the main and the UCPE camera stream.
+    assert (CAM_SOFTMAX_LAYER, False) in state.final
+    assert (CAM_SOFTMAX_LAYER, True) in state.final
+    # GDN blocks contribute nothing to the softmax carrier.
+    assert all(layer not in {k[0] for k in state.final} for layer in GDN_LAYERS)
+
+
+def test_cam_window_seed_changes_real_model_output(cam_transformer: SanaWmTransformer3DModel) -> None:
+    lat, ehs, raymap = _latents(2), _prompt(), _raymap(2)
+    with torch.no_grad():
+        probe = SoftmaxKvState(capture=True)
+        base = cam_transformer(lat, 500.0, encoder_hidden_states=ehs, raymap=raymap, softmax_state=probe)
+        key, _ = probe.final[(CAM_SOFTMAX_LAYER, True)]
+        b, h, _, d = key.shape
+        win = SoftmaxKvState(
+            init={(CAM_SOFTMAX_LAYER, True): (torch.randn(b, h, 2 * 4, d), torch.randn(b, h, 2 * 4, d))},
+            capture=False,
+        )
+        seeded = cam_transformer(lat, 500.0, encoder_hidden_states=ehs, raymap=raymap, softmax_state=win)
+    assert seeded.shape == base.shape  # queries stay current-chunk only
+    assert not torch.allclose(seeded, base)  # the camera window feeds the attention

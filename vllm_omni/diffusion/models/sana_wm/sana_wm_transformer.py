@@ -1295,6 +1295,7 @@ class SanaWmSelfAttention(nn.Module):
         spatial_shape: tuple[int, int, int],
         camera_conditions: torch.Tensor,
         rotary_emb: torch.Tensor | None,
+        softmax_state: SoftmaxKvState | None = None,
     ) -> torch.Tensor:
         """UCPE camera branch for softmax hybrid blocks.
 
@@ -1345,6 +1346,9 @@ class SanaWmSelfAttention(nn.Module):
         query = q_cam_trans
         key = k_cam_trans
         value = v_cam_trans
+        # Sliding-window KV cache for the camera stream: prepend the cached
+        # window (post-UCPE K/V) and record this chunk's, like the main branch.
+        key, value = self._apply_kv_window(softmax_state, key, value, is_cam=True)
         # Match NVlabs ``_forward_softmax_attn_sdpa``: promote to fp32 to honor
         # ``fp32_attention=True``, then demote back to bf16 for SDPA so we
         # get FlashAttention instead of the fp32 math-backend fallback. The
@@ -1693,6 +1697,7 @@ class SanaWmSelfAttention(nn.Module):
                     spatial_shape,
                     camera_conditions,
                     rotary_emb,
+                    softmax_state,
                 )
                 cam_contrib = _linear_output(self.out_proj_cam(cam_raw))
                 cam_contrib = self._match_local_inner_dim(cam_contrib, main_raw)

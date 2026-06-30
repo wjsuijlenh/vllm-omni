@@ -66,9 +66,12 @@ def _gdn_key(layer_index: int, is_negative: bool = False) -> str:
     return f"{_GDN_KEY}/{branch}/{layer_index}"
 
 
-def _softmax_kv_key(layer_index: int, is_negative: bool) -> str:
+def _softmax_kv_key(layer_index: int, is_negative: bool, is_cam: bool = False) -> str:
+    # Two independent windows per softmax block: the main self-attention K/V and
+    # the UCPE camera branch's K/V (separate head dims, separate sliding windows).
     branch = "neg" if is_negative else "pos"
-    return f"{_SOFTMAX_KV_KEY}/{branch}/{layer_index}"
+    stream = "cam" if is_cam else "main"
+    return f"{_SOFTMAX_KV_KEY}/{stream}/{branch}/{layer_index}"
 
 
 def _text_key(layer_index: int, is_negative: bool) -> str:
@@ -179,9 +182,13 @@ class SanaWmArStateAdapter:
 
         for layer in self._softmax_layers:
             for is_neg in (False, True):
-                kv = PagedKV()
-                kv.allocate(batch_size=batch_size, dtype=dtype, device=device, num_heads=h, head_dim=d)
-                session.put(_softmax_kv_key(layer, is_neg), kv)
+                for is_cam in (False, True):
+                    kv = PagedKV()
+                    # The empty (seq==0) buffer is only an "is-empty" sentinel; the
+                    # real head count/dim come from the first committed chunk, so
+                    # the cam branch's differing dims need no special allocation.
+                    kv.allocate(batch_size=batch_size, dtype=dtype, device=device, num_heads=h, head_dim=d)
+                    session.put(_softmax_kv_key(layer, is_neg, is_cam), kv)
 
         for layer in range(self._num_blocks):
             for is_neg in (False, True):
@@ -224,14 +231,16 @@ class SanaWmArStateAdapter:
 
     # -- softmax sink/window KV -----------------------------------------
 
-    def get_softmax_kv(self, layer_index: int, is_negative: bool = False) -> torch.Tensor:
-        return self._softmax_object(layer_index, is_negative).view()
+    def get_softmax_kv(self, layer_index: int, is_negative: bool = False, is_cam: bool = False) -> torch.Tensor:
+        return self._softmax_object(layer_index, is_negative, is_cam).view()
 
-    def commit_softmax_kv(self, layer_index: int, kv: torch.Tensor, is_negative: bool = False) -> None:
-        self._softmax_object(layer_index, is_negative).commit(kv)
+    def commit_softmax_kv(
+        self, layer_index: int, kv: torch.Tensor, is_negative: bool = False, is_cam: bool = False
+    ) -> None:
+        self._softmax_object(layer_index, is_negative, is_cam).commit(kv)
 
-    def _softmax_object(self, layer_index: int, is_negative: bool) -> PagedKV:
-        obj = self._session.get(_softmax_kv_key(layer_index, is_negative))
+    def _softmax_object(self, layer_index: int, is_negative: bool, is_cam: bool = False) -> PagedKV:
+        obj = self._session.get(_softmax_kv_key(layer_index, is_negative, is_cam))
         if not isinstance(obj, PagedKV) or not obj.resident:
             raise RuntimeError(
                 f"Softmax KV for layer {layer_index} not initialized; call create_state first "
