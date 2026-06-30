@@ -29,7 +29,9 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.sana_wm.ar_rollout import (
     autoregressive_segments,
     commit_chunk_state,
+    commit_softmax_window,
     slice_camera_frames,
+    softmax_step_state,
     step_state,
 )
 from vllm_omni.diffusion.models.sana_wm.camera_control import (
@@ -1038,6 +1040,14 @@ class SanaWmPipeline(
         adapter.reset()
         adapter.create_state(1, dtype, device)
 
+        # Softmax sliding-window KV cache (Fix 3): the 5 softmax blocks attend
+        # over [sink + recent window + current chunk]. ``spatial_tokens`` is the
+        # per-frame token count; ``window_frames`` bounds the retained history
+        # (<= 0 keeps the full history -- correct but unbounded). The clip's first
+        # frame stays as the sink anchor.
+        spatial_tokens = latent_height * latent_width
+        window_frames = int(extra_args.get("sana_wm_ar_kv_window_frames", 10))
+
         spans = autoregressive_segments(latent_frames, chunk_size)
         for span in spans:
             # Contiguous, non-overlapping chunk: denoise only this chunk's own
@@ -1059,6 +1069,17 @@ class SanaWmPipeline(
                 condition_mask = torch.zeros(1, 1, cam_frames, 1, 1, device=device, dtype=dtype)
                 condition_mask[:, :, anchor_local] = 1.0
 
+            # Softmax window seeds for the noisy steps: read-only (the window only
+            # changes on the clean pass), so build once per chunk and reuse. The
+            # absolute ``frame_offset`` makes this chunk's Q/K rotate at their true
+            # positions so they line up with the cached window's baked-in RoPE.
+            sm_pos = softmax_step_state(adapter, is_first_chunk=span.is_first, capture=False, is_negative=False)
+            sm_neg = (
+                softmax_step_state(adapter, is_first_chunk=span.is_first, capture=False, is_negative=True)
+                if do_cfg
+                else None
+            )
+
             for timestep in timesteps:
                 model_timestep = timestep.float().expand(1, 1, cam_frames).clone()
                 if anchor_local is not None:
@@ -1076,6 +1097,8 @@ class SanaWmPipeline(
                     raymap=chunk_raymap,
                     spatial_raymap=chunk_spatial,
                     gdn_state=pos_state,
+                    softmax_state=sm_pos,
+                    frame_offset=span.start,
                 )
                 if do_cfg:
                     neg_state = step_state(adapter, is_first_chunk=span.is_first, capture=False, is_negative=True)
@@ -1088,6 +1111,8 @@ class SanaWmPipeline(
                         raymap=chunk_raymap,
                         spatial_raymap=chunk_spatial,
                         gdn_state=neg_state,
+                        softmax_state=sm_neg,
+                        frame_offset=span.start,
                     )
                     noise_pred = noise_pred_uncond + params.cfg_scale * (noise_pred_cond - noise_pred_uncond)
                 else:
@@ -1115,6 +1140,9 @@ class SanaWmPipeline(
             if span.index + 1 < len(spans):
                 clean_timestep = torch.zeros(1, 1, cam_frames, device=device, dtype=torch.float32)
                 clean_pos = step_state(adapter, is_first_chunk=span.is_first, capture=True, is_negative=False)
+                sm_clean_pos = softmax_step_state(
+                    adapter, is_first_chunk=span.is_first, capture=True, is_negative=False
+                )
                 self.transformer(
                     chunk_latents,
                     clean_timestep,
@@ -1124,10 +1152,18 @@ class SanaWmPipeline(
                     raymap=chunk_raymap,
                     spatial_raymap=chunk_spatial,
                     gdn_state=clean_pos,
+                    softmax_state=sm_clean_pos,
+                    frame_offset=span.start,
                 )
                 commit_chunk_state(adapter, clean_pos, is_negative=False)
+                commit_softmax_window(
+                    adapter, sm_clean_pos, spatial_tokens=spatial_tokens, window_frames=window_frames, is_negative=False
+                )
                 if do_cfg:
                     clean_neg = step_state(adapter, is_first_chunk=span.is_first, capture=True, is_negative=True)
+                    sm_clean_neg = softmax_step_state(
+                        adapter, is_first_chunk=span.is_first, capture=True, is_negative=True
+                    )
                     self.transformer(
                         chunk_latents,
                         clean_timestep,
@@ -1137,8 +1173,17 @@ class SanaWmPipeline(
                         raymap=chunk_raymap,
                         spatial_raymap=chunk_spatial,
                         gdn_state=clean_neg,
+                        softmax_state=sm_clean_neg,
+                        frame_offset=span.start,
                     )
                     commit_chunk_state(adapter, clean_neg, is_negative=True)
+                    commit_softmax_window(
+                        adapter,
+                        sm_clean_neg,
+                        spatial_tokens=spatial_tokens,
+                        window_frames=window_frames,
+                        is_negative=True,
+                    )
 
             adapter.chunk_index = span.index + 1
 

@@ -493,15 +493,27 @@ class SanaWmWanRotaryPosEmbed(nn.Module):
         )
         return torch.cat([self._build_1d_freq(dim, positions) for dim in dims], dim=1)
 
-    def forward(self, spatial_shape: tuple[int, int, int], device: torch.device) -> torch.Tensor:
+    def forward(
+        self, spatial_shape: tuple[int, int, int], device: torch.device, frame_offset: int = 0
+    ) -> torch.Tensor:
+        """Build the 3D-RoPE table for a token grid.
+
+        ``frame_offset`` shifts the temporal positions to ``[frame_offset,
+        frame_offset + frames)`` instead of ``[0, frames)``. Chunk-causal
+        autoregressive rollouts pass the chunk's absolute start frame so each
+        chunk's Q/K rotate at their true positions -- required once a softmax
+        block attends over a cached window whose keys carry absolute positions.
+        """
         frames, height, width = spatial_shape
-        if max(spatial_shape) > self.freqs.shape[0]:
-            self.freqs = self._build_freqs(max(spatial_shape)).to(self.freqs.device)
+        needed = max(frame_offset + frames, height, width)
+        if needed > self.freqs.shape[0]:
+            self.freqs = self._build_freqs(needed).to(self.freqs.device)
         freqs = self.freqs.to(device=device)
         freqs_f, freqs_h, freqs_w = freqs.split(self._split_sizes, dim=1)
         f_dim, h_dim, w_dim = self._split_sizes
+        freqs_f_chunk = freqs_f[frame_offset : frame_offset + frames]
         parts = [
-            freqs_f[:frames].view(frames, 1, 1, f_dim).expand(frames, height, width, f_dim),
+            freqs_f_chunk.view(frames, 1, 1, f_dim).expand(frames, height, width, f_dim),
             freqs_h[:height].view(1, height, 1, h_dim).expand(frames, height, width, h_dim),
             freqs_w[:width].view(1, 1, width, w_dim).expand(frames, height, width, w_dim),
         ]
@@ -616,6 +628,36 @@ class GdnArState:
     def seed_for(self, block_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         seed = self.init.get(block_idx)
         return (None, None) if seed is None else seed
+
+
+@dataclass
+class SoftmaxKvState:
+    """Per-forward carrier threading the autoregressive softmax sliding-window KV
+    cache through the blocks.
+
+    ``init`` maps a softmax block to the cached ``(key, value)`` window
+    (post-RoPE, each ``(B, H, N_cached, D)``) from earlier chunks; the block
+    prepends it along the token axis so this chunk's queries attend over
+    ``[window + current]`` non-causally. A missing entry means no cached context
+    (the first chunk). ``final`` is filled during the forward with each softmax
+    block's current-chunk ``(key, value)`` so the rollout can slide the window
+    forward. ``capture`` requests recording ``final``; when ``False`` the softmax
+    forward runs exactly as the non-autoregressive path.
+
+    Keys are ``(block_idx, is_cam)``. Only the main self-attention branch
+    (``is_cam=False``) is cached today; the ``is_cam`` axis reserves room for the
+    UCPE camera branch without reshaping the carrier. GDN blocks never appear --
+    this mirrors ``SanaWmArStateAdapter.softmax_layers``.
+
+    Correctness note: the cached keys carry their original absolute RoPE
+    positions, so the AR path must rotate each chunk's Q/K at absolute frame
+    positions (the transformer's ``frame_offset``); otherwise cached and current
+    keys collide in position space.
+    """
+
+    init: dict[tuple[int, bool], tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    final: dict[tuple[int, bool], tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    capture: bool = True
 
 
 class SanaWmSelfAttention(nn.Module):
@@ -1161,17 +1203,49 @@ class SanaWmSelfAttention(nn.Module):
             rotary_emb_freqs = rotary_emb_freqs.squeeze(0)
         return rotary_emb_freqs
 
+    def _apply_kv_window(
+        self,
+        state: SoftmaxKvState | None,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        is_cam: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sliding-window KV cache for one softmax branch (autoregressive path).
+
+        ``key``/``value`` are ``(B, H, N, D)`` for the current chunk (post-RoPE
+        for the main branch, post-UCPE for the cam branch). When ``state`` carries
+        a cached window for this block it is prepended along the token axis so the
+        current queries attend over ``[window + current]``; when ``state.capture``
+        is set the current chunk's K/V are recorded for the next chunk. A ``None``
+        ``state`` is a no-op, so the non-autoregressive path is unchanged.
+        """
+        if state is None:
+            return key, value
+        slot = (getattr(self, "block_idx", 0), is_cam)
+        if state.capture:
+            state.final[slot] = (key.detach(), value.detach())
+        cached = state.init.get(slot)
+        if cached is not None:
+            cached_k, cached_v = cached
+            key = torch.cat([cached_k.to(key.device, key.dtype), key], dim=2)
+            value = torch.cat([cached_v.to(value.device, value.dtype), value], dim=2)
+        return key, value
+
     def _forward_softmax_raw(
         self,
         hidden_states: torch.Tensor,
         spatial_shape: tuple[int, int, int],
         rotary_emb: torch.Tensor | None,
+        softmax_state: SoftmaxKvState | None = None,
     ) -> torch.Tensor:
         """Softmax self-attention raw output before output_gate/proj.
 
         Mirrors NVlabs ``_forward_softmax_attn(..., apply_output_gate=False)``
         for every-N-th hybrid blocks. GDN-specific gates are intentionally not
-        used here.
+        used here. When ``softmax_state`` is given, this block prepends its cached
+        sliding-window K/V (and records the current chunk's K/V) so chunk-causal
+        rollouts attend across chunk boundaries.
         """
         batch_size, token_count, hidden_size = hidden_states.shape
         frames, height, width = spatial_shape
@@ -1194,6 +1268,10 @@ class SanaWmSelfAttention(nn.Module):
         query = query.transpose(1, 2)  # (B, H, N, D)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
+
+        # Prepend the cached sliding window (and record this chunk's K/V). Queries
+        # stay current-chunk only; keys/values span [window + current].
+        key, value = self._apply_kv_window(softmax_state, key, value, is_cam=False)
 
         dtype_orig = hidden_states.dtype
         # NVlabs runs SDPA in bf16 even when ``fp32_attention=True`` because
@@ -1566,6 +1644,7 @@ class SanaWmSelfAttention(nn.Module):
         rotary_emb: torch.Tensor | None = None,
         camera_conditions: torch.Tensor | None = None,
         gdn_state: GdnArState | None = None,
+        softmax_state: SoftmaxKvState | None = None,
     ) -> torch.Tensor:
         """Forward with dual-branch GDN+UCPE when ``camera_conditions`` is
         provided, otherwise main-branch-only GDN or softmax fallback.
@@ -1607,7 +1686,7 @@ class SanaWmSelfAttention(nn.Module):
             return attn_out
 
         if spatial_shape is not None:
-            main_raw = self._forward_softmax_raw(hidden_states, spatial_shape, rotary_emb)
+            main_raw = self._forward_softmax_raw(hidden_states, spatial_shape, rotary_emb, softmax_state)
             if camera_conditions is not None and self.q_proj_cam is not None:
                 cam_raw = self._forward_softmax_cam_branch(
                     hidden_states,
@@ -1916,6 +1995,7 @@ class SanaWmBlock(nn.Module):
         camera_conditions: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         gdn_state: GdnArState | None = None,
+        softmax_state: SoftmaxKvState | None = None,
     ) -> torch.Tensor:
         # NVlabs dispatch convention: when timestep
         # modulation carries a frame axis (ndim > 2), route through the
@@ -1931,13 +2011,14 @@ class SanaWmBlock(nn.Module):
                 camera_conditions,
                 encoder_attention_mask,
                 gdn_state,
+                softmax_state,
             )
         batch_size = hidden_states.shape[0]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.scale_shift_table[None] + timestep_modulation.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
         attn_input = self._modulate(self.norm1(hidden_states), shift_msa, scale_msa)
-        attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_conditions, gdn_state)
+        attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_conditions, gdn_state, softmax_state)
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         hidden_states = hidden_states + gate_msa * attn_output
@@ -1961,6 +2042,7 @@ class SanaWmBlock(nn.Module):
         camera_conditions: torch.Tensor | None,
         encoder_attention_mask: torch.Tensor | None = None,
         gdn_state: GdnArState | None = None,
+        softmax_state: SoftmaxKvState | None = None,
     ) -> torch.Tensor:
         """Per-frame timestep modulation path matching NVlabs
         ``SanaVideoMSCamCtrlBlock.forward_frame_aware``.
@@ -1991,7 +2073,7 @@ class SanaWmBlock(nn.Module):
         # scale/shift over the spatial axis, then flattening back.
         x_norm1 = self.norm1(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_msa_in = (x_norm1 * (1 + scale_msa) + shift_msa).reshape(batch_size, token_count, hidden_size)
-        attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, camera_conditions, gdn_state)
+        attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, camera_conditions, gdn_state, softmax_state)
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         attn_output_4d = attn_output.reshape(batch_size, frames, spatial_tokens, hidden_size)
@@ -2322,6 +2404,8 @@ class SanaWmTransformer3DModel(nn.Module):
         raymap: torch.Tensor | None = None,
         spatial_raymap: torch.Tensor | None = None,
         gdn_state: GdnArState | None = None,
+        softmax_state: SoftmaxKvState | None = None,
+        frame_offset: int = 0,
     ) -> torch.Tensor:
         if hidden_states.ndim != 5:
             raise ValueError("Sana-WM transformer expects latent input shaped [B, C, F, H, W].")
@@ -2359,8 +2443,10 @@ class SanaWmTransformer3DModel(nn.Module):
         hidden_states, spatial_shape = self.x_embedder.project_with_shape(hidden_states)
         rotary_emb = None
         if self.config.pos_embed_type == "wan_rope":
-            rotary_emb = self.rope(spatial_shape, hidden_states.device)
+            rotary_emb = self.rope(spatial_shape, hidden_states.device, frame_offset=frame_offset)
         else:
+            if frame_offset != 0:
+                raise NotImplementedError("frame_offset is only supported for the wan_rope position embedding.")
             hidden_states = hidden_states + self._positional_embedding(
                 hidden_states.shape[1], hidden_states.dtype, hidden_states.device
             )
@@ -2453,6 +2539,7 @@ class SanaWmTransformer3DModel(nn.Module):
                 camera_conditions,
                 encoder_attention_mask,
                 gdn_state,
+                softmax_state,
             )
 
         hidden_states = self.final_layer(hidden_states, time_embed.to(hidden_states.dtype), spatial_shape)

@@ -28,13 +28,16 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
-from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import GdnArState
+from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import GdnArState, SoftmaxKvState
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 FIRST_CHUNK_PLUS_ONE = "first_chunk_plus_one"
 UNIFORM = "uniform"
+
+# Default frames retained at the front of the softmax window (the clean anchor).
+SOFTMAX_SINK_FRAMES = 1
 
 
 class _GdnStateStore(Protocol):
@@ -48,6 +51,23 @@ class _GdnStateStore(Protocol):
     def commit_gdn_state(
         self, layer_index: int, state_kv: torch.Tensor, state_z: torch.Tensor, is_negative: bool = ...
     ) -> None: ...
+
+
+class _SoftmaxKvStore(Protocol):
+    """The subset of ``SanaWmArStateAdapter`` the softmax-window helpers depend on.
+
+    ``get_softmax_kv`` / ``commit_softmax_kv`` round-trip a single stacked tensor
+    ``(2, B, seq, H, D)`` (slot 0 = key, slot 1 = value) per softmax block and CFG
+    branch -- the ``PagedKV`` layout already used by the adapter. An empty window
+    is ``seq == 0``.
+    """
+
+    @property
+    def softmax_layers(self) -> tuple[int, ...]: ...
+
+    def get_softmax_kv(self, layer_index: int, is_negative: bool = ...) -> torch.Tensor: ...
+
+    def commit_softmax_kv(self, layer_index: int, kv: torch.Tensor, is_negative: bool = ...) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -167,6 +187,82 @@ def commit_chunk_state(store: _GdnStateStore, state: GdnArState, *, is_negative:
     """Write a chunk's captured terminal GDN state back to the store."""
     for layer, (state_kv, state_z) in state.final.items():
         store.commit_gdn_state(layer, state_kv, state_z, is_negative)
+
+
+def softmax_step_state(
+    store: _SoftmaxKvStore,
+    *,
+    is_first_chunk: bool,
+    capture: bool,
+    is_negative: bool = False,
+) -> SoftmaxKvState:
+    """Build the ``SoftmaxKvState`` carrier for one denoise step of a chunk.
+
+    The first chunk has no cached context (empty ``init``). Later chunks seed each
+    softmax block from the windowed ``(key, value)`` the store accumulated from
+    earlier chunks, converted from the ``PagedKV`` layout ``(2, B, seq, H, D)`` to
+    the per-branch ``(B, H, seq, D)`` the transformer prepends. ``capture`` should
+    be ``True`` only on the chunk's clean-sigma pass, so the recorded K/V belong
+    to the settled latent (mirroring the GDN carry).
+    """
+    init: dict[tuple[int, bool], tuple[torch.Tensor, torch.Tensor]] = {}
+    if not is_first_chunk:
+        for layer in store.softmax_layers:
+            kv = store.get_softmax_kv(layer, is_negative)  # (2, B, seq, H, D)
+            if kv.shape[2] > 0:
+                key = kv[0].permute(0, 2, 1, 3).contiguous()  # (B, H, seq, D)
+                value = kv[1].permute(0, 2, 1, 3).contiguous()
+                init[(layer, False)] = (key, value)
+    return SoftmaxKvState(init=init, capture=capture)
+
+
+def _evict_window(kv: torch.Tensor, spatial_tokens: int, window_frames: int, sink_frames: int) -> torch.Tensor:
+    """Trim a stacked ``(2, B, seq, H, D)`` window to ``sink + sliding window``.
+
+    Eviction is at frame granularity (``seq`` is a multiple of ``spatial_tokens``):
+    the first ``sink_frames`` frames are always kept (the anchor), plus the most
+    recent ``window_frames`` frames. This realises the upstream "sink + sliding
+    window" policy; it evicts by frame rather than by whole chunk, which differs
+    only at the (larger) first chunk's boundary.
+    """
+    if window_frames <= 0:
+        return kv  # unbounded: keep the full history (correct but not memory-bounded)
+    seq = kv.shape[2]
+    total_frames = seq // spatial_tokens
+    if total_frames <= sink_frames + window_frames:
+        return kv
+    sink = kv[:, :, : sink_frames * spatial_tokens]
+    window = kv[:, :, seq - window_frames * spatial_tokens :]
+    return torch.cat([sink, window], dim=2)
+
+
+def commit_softmax_window(
+    store: _SoftmaxKvStore,
+    state: SoftmaxKvState,
+    *,
+    spatial_tokens: int,
+    window_frames: int,
+    sink_frames: int = SOFTMAX_SINK_FRAMES,
+    is_negative: bool = False,
+) -> None:
+    """Append a chunk's captured softmax K/V to the window and slide it forward.
+
+    For each cached softmax block the current chunk's ``(key, value)``
+    (``(B, H, N, D)``) is converted to the ``PagedKV`` layout, concatenated onto
+    the existing window along the token axis, trimmed by :func:`_evict_window`,
+    and written back. The ``is_cam`` camera branch is not windowed yet and is
+    skipped here.
+    """
+    for (layer, is_cam), (key, value) in state.final.items():
+        if is_cam:
+            continue
+        key_store = key.permute(0, 2, 1, 3)  # (B, N, H, D)
+        value_store = value.permute(0, 2, 1, 3)
+        new = torch.stack([key_store, value_store], dim=0)  # (2, B, N, H, D)
+        prev = store.get_softmax_kv(layer, is_negative)  # (2, B, seq, H, D); seq == 0 when empty
+        combined = torch.cat([prev, new], dim=2) if prev.shape[2] > 0 else new
+        kept = _evict_window(combined, spatial_tokens, window_frames, sink_frames)
+        store.commit_softmax_kv(layer, kept, is_negative)
 
 
 def slice_camera_frames(tensor: torch.Tensor | None, span: ChunkSpan, *, frame_dim: int) -> torch.Tensor | None:

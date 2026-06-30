@@ -21,11 +21,13 @@ from vllm_omni.diffusion.models.sana_wm.ar_rollout import (
     ChunkSpan,
     autoregressive_segments,
     commit_chunk_state,
+    commit_softmax_window,
     plan_chunks,
     slice_camera_frames,
+    softmax_step_state,
     step_state,
 )
-from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import GdnArState
+from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import GdnArState, SoftmaxKvState
 from vllm_omni.experimental.world_models.adapters.state_sana_wm_ar_adapter import SanaWmArStateAdapter
 from vllm_omni.experimental.world_models.memory import SessionMemoryManager
 
@@ -157,6 +159,95 @@ def test_commit_chunk_state_writes_back() -> None:
     state.final[1] = (new_kv, new_z)
     commit_chunk_state(store, state, is_negative=False)
     torch.testing.assert_close(store.get_gdn_state(1, False)["state_kv"], new_kv)
+
+
+# -- softmax sliding-window KV cache (Fix 3) ------------------------------
+
+
+SM_LAYERS = (3, 7)
+SM_B, SM_H, SM_D, SM_S = 1, 2, 4, 4  # batch, kv-heads, head_dim, spatial tokens/frame
+
+
+class _StubSoftmaxStore:
+    """Minimal softmax-KV store: holds one stacked ``(2, B, seq, H, D)`` per
+    (layer, branch), seq==0 when empty (the ``PagedKV`` layout the adapter uses)."""
+
+    def __init__(self) -> None:
+        self.softmax_layers = SM_LAYERS
+        self._kv = {
+            (layer, neg): torch.zeros(2, SM_B, 0, SM_H, SM_D) for layer in SM_LAYERS for neg in (False, True)
+        }
+
+    def get_softmax_kv(self, layer_index: int, is_negative: bool = False) -> torch.Tensor:
+        return self._kv[(layer_index, is_negative)]
+
+    def commit_softmax_kv(self, layer_index: int, kv: torch.Tensor, is_negative: bool = False) -> None:
+        self._kv[(layer_index, is_negative)] = kv
+
+
+def _chunk_kv(frame_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build (key, value) (B, H, N, D) tagged so every token of frame f holds f."""
+    n = len(frame_ids) * SM_S
+    key = torch.zeros(SM_B, SM_H, n, SM_D)
+    for i, fid in enumerate(frame_ids):
+        key[:, :, i * SM_S : (i + 1) * SM_S] = float(fid)
+    return key, key.clone() + 0.5  # value distinct from key
+
+
+def _frame_ids_of(stored_kv: torch.Tensor) -> list[float]:
+    """Recover the per-frame tag from a stored (2, B, seq, H, D) window (key slot)."""
+    seq = stored_kv.shape[2]
+    return [float(stored_kv[0, 0, f * SM_S, 0, 0]) for f in range(seq // SM_S)]
+
+
+def test_softmax_step_state_first_chunk_is_empty() -> None:
+    state = softmax_step_state(_StubSoftmaxStore(), is_first_chunk=True, capture=False)
+    assert state.init == {}
+    assert state.capture is False
+
+
+def test_softmax_window_accumulates_then_slides_with_sink() -> None:
+    store = _StubSoftmaxStore()
+    # Chunk 0: frames [0,1,2]. Commit through a captured carrier.
+    s0 = SoftmaxKvState(capture=True)
+    for layer in SM_LAYERS:
+        s0.final[(layer, False)] = _chunk_kv([0, 1, 2])
+    commit_softmax_window(store, s0, spatial_tokens=SM_S, window_frames=2, sink_frames=1)
+    # 3 frames <= sink(1)+window(2): nothing evicted yet.
+    assert _frame_ids_of(store.get_softmax_kv(3)) == [0.0, 1.0, 2.0]
+
+    # Next chunk seeds from the accumulated window (B, H, seq, D).
+    seeded = softmax_step_state(store, is_first_chunk=False, capture=True)
+    key, value = seeded.init[(3, False)]
+    assert key.shape == (SM_B, SM_H, 3 * SM_S, SM_D)
+    assert value.shape == (SM_B, SM_H, 3 * SM_S, SM_D)
+
+    # Chunk 1: frames [3,4,5]. Now 6 frames > 3 -> evict to sink + last 2.
+    s1 = SoftmaxKvState(capture=True)
+    for layer in SM_LAYERS:
+        s1.final[(layer, False)] = _chunk_kv([3, 4, 5])
+    commit_softmax_window(store, s1, spatial_tokens=SM_S, window_frames=2, sink_frames=1)
+    # Sink = frame 0; sliding window = the two most recent frames (4, 5).
+    assert _frame_ids_of(store.get_softmax_kv(3)) == [0.0, 4.0, 5.0]
+    assert _frame_ids_of(store.get_softmax_kv(7)) == [0.0, 4.0, 5.0]
+
+
+def test_softmax_window_unbounded_keeps_full_history() -> None:
+    store = _StubSoftmaxStore()
+    for frames in ([0, 1, 2], [3, 4]):
+        state = SoftmaxKvState(capture=True)
+        for layer in SM_LAYERS:
+            state.final[(layer, False)] = _chunk_kv(frames)
+        commit_softmax_window(store, state, spatial_tokens=SM_S, window_frames=0, sink_frames=1)
+    assert _frame_ids_of(store.get_softmax_kv(3)) == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+def test_commit_softmax_window_skips_cam_branch() -> None:
+    store = _StubSoftmaxStore()
+    state = SoftmaxKvState(capture=True)
+    state.final[(3, True)] = _chunk_kv([0])  # cam branch entry -> ignored
+    commit_softmax_window(store, state, spatial_tokens=SM_S, window_frames=4)
+    assert store.get_softmax_kv(3).shape[2] == 0  # nothing written
 
 
 # -- camera slicing -------------------------------------------------------
