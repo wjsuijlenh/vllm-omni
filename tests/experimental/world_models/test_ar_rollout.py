@@ -21,7 +21,9 @@ from vllm_omni.diffusion.models.sana_wm.ar_rollout import (
     ChunkSpan,
     autoregressive_segments,
     commit_chunk_state,
+    commit_conv_chunk,
     commit_softmax_window,
+    conv_step_state,
     plan_chunks,
     slice_camera_frames,
     softmax_step_state,
@@ -281,6 +283,49 @@ def test_slice_camera_frames_too_few() -> None:
     cam = torch.zeros(1, 3, 20)
     with pytest.raises(ValueError):
         slice_camera_frames(cam, ChunkSpan(index=0, start=0, end=5), frame_dim=1)
+
+
+# -- temporal-conv boundary carry (real adapter round-trip) ---------------
+
+
+def test_conv_step_state_first_chunk_is_empty() -> None:
+    adapter = _adapter()
+    state = conv_step_state(adapter, is_first_chunk=True, capture=True)
+    assert state.init == {}
+    assert state.capture is True
+
+
+def test_conv_state_round_trips_through_adapter() -> None:
+    adapter = _adapter()
+    # Chunk 0: nothing to seed; commit two slots' trailing frames.
+    s0 = conv_step_state(adapter, is_first_chunk=True, capture=True)
+    k_frames = torch.randn(BATCH * 4, 3, DIM * HEADS)  # (B*S, kernel-1, C) for conv_k
+    t_frames = torch.randn(BATCH, DIM * HEADS, 1, 4)  # (B, C, kernel//2, H*W) for t_conv
+    s0.final[(0, "k")] = k_frames
+    s0.final[(1, "ffn_t")] = t_frames
+    commit_conv_chunk(adapter, s0)
+
+    # Chunk 1: both committed slots are seeded back with identical values.
+    s1 = conv_step_state(adapter, is_first_chunk=False, capture=True)
+    assert set(s1.init) == {(0, "k"), (1, "ffn_t")}
+    torch.testing.assert_close(s1.init[(0, "k")], k_frames)
+    torch.testing.assert_close(s1.init[(1, "ffn_t")], t_frames)
+
+
+def test_conv_state_branches_do_not_alias() -> None:
+    adapter = _adapter()
+    pos = conv_step_state(adapter, is_first_chunk=True, capture=True)
+    pos.final[(0, "k")] = torch.ones(BATCH * 4, 3, DIM * HEADS)
+    commit_conv_chunk(adapter, pos, is_negative=False)
+
+    neg = conv_step_state(adapter, is_first_chunk=True, capture=True)
+    neg.final[(0, "k")] = torch.full((BATCH * 4, 3, DIM * HEADS), 2.0)
+    commit_conv_chunk(adapter, neg, is_negative=True)
+
+    seeded_pos = conv_step_state(adapter, is_first_chunk=False, capture=False, is_negative=False)
+    seeded_neg = conv_step_state(adapter, is_first_chunk=False, capture=False, is_negative=True)
+    torch.testing.assert_close(seeded_pos.init[(0, "k")], torch.ones(BATCH * 4, 3, DIM * HEADS))
+    torch.testing.assert_close(seeded_neg.init[(0, "k")], torch.full((BATCH * 4, 3, DIM * HEADS), 2.0))
 
 
 # -- integrated multi-chunk rollout with a real adapter -------------------

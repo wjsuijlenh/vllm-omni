@@ -54,9 +54,12 @@ _GDN_KEY = "gdn"
 _SOFTMAX_KV_KEY = "softmax_kv"
 _TEXT_KEY = "text"
 _WARMUP_KEY = "warmup_latents"
+_CONV_KEY = "conv"
 _NUM_GDN_LAYERS = "_num_gdn_layers"
+_CONV_SLOTS_ATTR = "_conv_slots"
 _STATE_KV = "state_kv"
 _STATE_Z = "state_z"
+_CONV_FRAMES = "frames"
 
 
 def _gdn_key(layer_index: int, is_negative: bool = False) -> str:
@@ -77,6 +80,14 @@ def _softmax_kv_key(layer_index: int, is_negative: bool, is_cam: bool = False) -
 def _text_key(layer_index: int, is_negative: bool) -> str:
     branch = "neg" if is_negative else "pos"
     return f"{_TEXT_KEY}/{branch}/{layer_index}"
+
+
+def _conv_key(layer_index: int, slot: str, is_negative: bool = False) -> str:
+    # Temporal-conv boundary state is per CFG branch and per conv slot ("k",
+    # "k_cam", "ffn_t"): the previous chunk's trailing conv-input frames that seed
+    # the next chunk's leading pad.
+    branch = "neg" if is_negative else "pos"
+    return f"{_CONV_KEY}/{branch}/{slot}/{layer_index}"
 
 
 class SanaWmArStateAdapter:
@@ -201,6 +212,10 @@ class SanaWmArStateAdapter:
         session.put(_WARMUP_KEY, warmup)
 
         session.attrs[_NUM_GDN_LAYERS] = len(self._gdn_layers)
+        # Temporal-conv boundary state is created lazily on the first commit (its
+        # shape depends on the spatial grid, unknown until the first forward), so
+        # only the slot registry is (re)initialised here.
+        session.attrs[_CONV_SLOTS_ATTR] = set()
         self.chunk_index = 0
 
     # -- GDN recurrent state --------------------------------------------
@@ -247,6 +262,51 @@ class SanaWmArStateAdapter:
                 f"(softmax layers are {self._softmax_layers})."
             )
         return obj
+
+    # -- temporal-conv boundary state -----------------------------------
+
+    def conv_slot_keys(self) -> tuple[tuple[int, str], ...]:
+        """The ``(block_index, slot)`` pairs that have committed conv state.
+
+        Populated on commit as convs fire, so only the slots the model actually
+        runs (e.g. no ``k_cam`` without a camera branch) are seeded next chunk.
+        """
+        return tuple(sorted(self._conv_slot_set()))
+
+    def get_conv_state(self, layer_index: int, slot: str, is_negative: bool = False) -> torch.Tensor | None:
+        """Return the previous chunk's trailing conv-input frames, or ``None``.
+
+        ``None`` (the reset chunk, or a slot that has never fired) tells the caller
+        to zero-pad -- identical to the non-autoregressive path.
+        """
+        obj = self._session.get(_conv_key(layer_index, slot, is_negative))
+        if isinstance(obj, FixedState) and obj.resident:
+            return obj.view()[_CONV_FRAMES]
+        return None
+
+    def commit_conv_state(
+        self, layer_index: int, slot: str, frames: torch.Tensor, is_negative: bool = False
+    ) -> None:
+        """Store a chunk's trailing conv-input frames for the next chunk.
+
+        The backing ``FixedState`` is allocated on first commit (its shape depends
+        on the spatial grid) and overwritten in place thereafter.
+        """
+        key = _conv_key(layer_index, slot, is_negative)
+        obj = self._session.get(key)
+        if not isinstance(obj, FixedState) or not obj.resident:
+            obj = FixedState()
+            obj.allocate(shapes={_CONV_FRAMES: tuple(frames.shape)}, dtype=frames.dtype, device=frames.device)
+            self._session.put(key, obj)
+            self._conv_slot_set().add((layer_index, slot))
+        obj.commit({_CONV_FRAMES: frames})
+
+    def _conv_slot_set(self) -> set[tuple[int, str]]:
+        slots = self._session.attrs.get(_CONV_SLOTS_ATTR)
+        if not isinstance(slots, set):
+            slots = set()
+            self._session.attrs[_CONV_SLOTS_ATTR] = slots
+        return slots
 
     # -- text cross-attention KV ----------------------------------------
 

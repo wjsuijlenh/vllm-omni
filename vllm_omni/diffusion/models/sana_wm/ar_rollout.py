@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
-from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import GdnArState, SoftmaxKvState
+from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import ConvArState, GdnArState, SoftmaxKvState
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -69,6 +69,23 @@ class _SoftmaxKvStore(Protocol):
 
     def commit_softmax_kv(
         self, layer_index: int, kv: torch.Tensor, is_negative: bool = ..., is_cam: bool = ...
+    ) -> None: ...
+
+
+class _ConvStateStore(Protocol):
+    """The subset of ``SanaWmArStateAdapter`` the temporal-conv helpers depend on.
+
+    Each ``(layer_index, slot)`` round-trips a single tensor: the previous chunk's
+    trailing conv-input frames. ``conv_slot_keys`` enumerates the slots that have
+    fired, so only the convs the model actually runs are seeded.
+    """
+
+    def conv_slot_keys(self) -> tuple[tuple[int, str], ...]: ...
+
+    def get_conv_state(self, layer_index: int, slot: str, is_negative: bool = ...) -> torch.Tensor | None: ...
+
+    def commit_conv_state(
+        self, layer_index: int, slot: str, frames: torch.Tensor, is_negative: bool = ...
     ) -> None: ...
 
 
@@ -189,6 +206,36 @@ def commit_chunk_state(store: _GdnStateStore, state: GdnArState, *, is_negative:
     """Write a chunk's captured terminal GDN state back to the store."""
     for layer, (state_kv, state_z) in state.final.items():
         store.commit_gdn_state(layer, state_kv, state_z, is_negative)
+
+
+def conv_step_state(
+    store: _ConvStateStore,
+    *,
+    is_first_chunk: bool,
+    capture: bool,
+    is_negative: bool = False,
+) -> ConvArState:
+    """Build the ``ConvArState`` carrier for one denoise step of a chunk.
+
+    The first chunk zero-pads every temporal conv (empty ``init``); later chunks
+    seed each ``(block, slot)`` from the trailing conv-input frames the previous
+    chunk committed. ``capture`` should be ``True`` only on the chunk's clean-sigma
+    pass, so the recorded frames belong to the settled latent -- mirroring the GDN
+    and softmax carries.
+    """
+    init: dict[tuple[int, str], torch.Tensor] = {}
+    if not is_first_chunk:
+        for block_idx, slot in store.conv_slot_keys():
+            frames = store.get_conv_state(block_idx, slot, is_negative)
+            if frames is not None:
+                init[(block_idx, slot)] = frames
+    return ConvArState(init=init, capture=capture)
+
+
+def commit_conv_chunk(store: _ConvStateStore, state: ConvArState, *, is_negative: bool = False) -> None:
+    """Write a chunk's captured trailing conv-input frames back to the store."""
+    for (block_idx, slot), frames in state.final.items():
+        store.commit_conv_state(block_idx, slot, frames, is_negative)
 
 
 def softmax_step_state(

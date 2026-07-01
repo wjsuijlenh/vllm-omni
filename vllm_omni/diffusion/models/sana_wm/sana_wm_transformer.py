@@ -660,6 +660,50 @@ class SoftmaxKvState:
     capture: bool = True
 
 
+@dataclass
+class ConvArState:
+    """Per-forward carrier threading temporal-conv boundary state across chunks.
+
+    The chunk-causal checkpoint caches, per block, the trailing input frames of
+    each temporal convolution and prepends them as the *leading* context of the
+    next chunk (upstream ``kv_cache`` slots 4 and 9); the trailing edge is always
+    left as the conv's own zeros, so the convs stay causal across chunk
+    boundaries. Without this the AR path zero-pads every chunk start and diverges
+    from the prefix reference at frame 0 of every chunk after the first.
+
+    ``init`` maps ``(block_idx, slot)`` to the previous chunk's trailing conv-input
+    frames that seed this chunk's leading pad; a missing entry means "zero-pad"
+    (the reset chunk / production path). ``final`` is filled during the forward
+    with this chunk's trailing frames so the rollout can carry them forward.
+    ``capture`` gates recording ``final``; when ``False`` the convs run exactly as
+    the non-autoregressive path (no state plumbing observable).
+
+    Slots, each storing the conv's own input in its native temporal layout:
+
+    * ``"k"``     -- main GDN key short-conv (causal, ``conv_kernel_size - 1``
+      frames of ``(B*S, T, C)``);
+    * ``"k_cam"`` -- UCPE camera key short-conv (same helper, cam channel dim);
+    * ``"ffn_t"`` -- FFN temporal conv (symmetric, ``t_kernel_size // 2`` frames of
+      ``(B, C, T, H*W)``).
+    """
+
+    init: dict[tuple[int, str], torch.Tensor] = field(default_factory=dict)
+    final: dict[tuple[int, str], torch.Tensor] = field(default_factory=dict)
+    capture: bool = True
+
+    def seed_for(self, block_idx: int, slot: str) -> torch.Tensor | None:
+        return self.init.get((block_idx, slot))
+
+
+# TEST-ONLY hook (equivalence harness): chunk boundaries for a chunk-causal softmax
+# mask on the *non-AR* full/prefix forward. The real chunk-causal checkpoint masks
+# its non-cached softmax so a query in chunk C attends only to chunks 0..C; the AR
+# (cached-window) path needs no mask because the cache already enforces causality
+# (upstream ``CachedChunkCausalSoftmaxAttn``: "cache enforces chunk causality").
+# Left as None in production, so the default forward is byte-identical.
+_REFERENCE_CHUNK_BOUNDARIES: list[int] | None = None
+
+
 class SanaWmSelfAttention(nn.Module):
     def __init__(
         self,
@@ -940,11 +984,31 @@ class SanaWmSelfAttention(nn.Module):
         )
 
     @staticmethod
-    def _causal_conv_1d(hidden_states: torch.Tensor, conv: nn.Conv1d) -> torch.Tensor:
+    def _causal_conv_1d(
+        hidden_states: torch.Tensor,
+        conv: nn.Conv1d,
+        left_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Depthwise causal temporal conv over ``(B', T, C)``.
+
+        Normally the ``kernel-1`` left taps are zero-padded. When ``left_context``
+        (the previous chunk's trailing ``kernel-1`` frames, ``(B', kernel-1, C)``)
+        is given, it replaces those zeros so the conv sees real cross-chunk past
+        context; the output is still aligned to the ``T`` current frames (the
+        prepended positions are consumed by the kernel, matching upstream's
+        ``y_fwd_full[:, K-1:]`` slice).
+        """
         dtype = hidden_states.dtype
+        pad = conv.kernel_size[0] - 1
         conv_input = hidden_states.transpose(1, 2).to(conv.weight.dtype)
-        conv_input = F.pad(conv_input, (conv.kernel_size[0] - 1, 0))
-        output = conv(conv_input).transpose(1, 2)
+        if left_context is None:
+            conv_input = F.pad(conv_input, (pad, 0))
+        else:
+            ctx = left_context.transpose(1, 2).to(conv.weight.dtype)
+            if ctx.shape[2] < pad:  # short first chunk: zero-fill the missing taps
+                ctx = F.pad(ctx, (pad - ctx.shape[2], 0))
+            conv_input = torch.cat([ctx, conv_input], dim=2)
+        output: torch.Tensor = conv(conv_input).transpose(1, 2)
         return output.to(dtype)
 
     def _bidirectional_temporal_short_conv(
@@ -952,9 +1016,24 @@ class SanaWmSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         conv: nn.Conv1d,
         spatial_shape: tuple[int, int, int],
+        *,
+        conv_state: ConvArState | None = None,
+        slot: str = "",
     ) -> torch.Tensor:
         hidden_states, batch_size, spatial_tokens, frames = self._reshape_to_temporal(hidden_states, spatial_shape)
-        forward_states = self._causal_conv_1d(hidden_states, conv)
+        # Autoregressive chunk carry (upstream cached ShortConv, slot 4): seed the
+        # forward pass with the previous chunk's trailing frames and record this
+        # chunk's own trailing frames. The backward pass stays per-chunk (its
+        # cross-chunk context would be future frames, which are never cached), so
+        # it keeps the zero-pad -- causal across chunk boundaries.
+        left_context: torch.Tensor | None = None
+        if conv_state is not None:
+            block_idx = getattr(self, "block_idx", 0)
+            pad = conv.kernel_size[0] - 1
+            left_context = conv_state.seed_for(block_idx, slot)
+            if conv_state.capture and pad > 0:
+                conv_state.final[(block_idx, slot)] = hidden_states[:, frames - pad :, :].detach().clone()
+        forward_states = self._causal_conv_1d(hidden_states, conv, left_context)
         backward_states = self._causal_conv_1d(hidden_states.flip(1), conv).flip(1)
         center_weight = conv.weight[:, 0, -1].to(hidden_states.dtype)
         center_states = hidden_states * center_weight.view(1, 1, -1)
@@ -988,6 +1067,7 @@ class SanaWmSelfAttention(nn.Module):
         *,
         precomputed_gates: tuple[torch.Tensor, torch.Tensor] | None = None,
         gdn_state: GdnArState | None = None,
+        conv_state: ConvArState | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Run main-branch bidirectional GDN and return the (B, N, q_size)
         raw output BEFORE ``output_gate`` and ``proj`` are applied.
@@ -1016,7 +1096,9 @@ class SanaWmSelfAttention(nn.Module):
         kv_size = self.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
         if self.conv_k is not None:
-            key = self._bidirectional_temporal_short_conv(key, self.conv_k, spatial_shape)
+            key = self._bidirectional_temporal_short_conv(
+                key, self.conv_k, spatial_shape, conv_state=conv_state, slot="k"
+            )
         if precomputed_gates is None:
             beta, decay = self._compute_frame_gates(hidden_states, spatial_shape)
         else:
@@ -1157,9 +1239,12 @@ class SanaWmSelfAttention(nn.Module):
         spatial_shape: tuple[int, int, int],
         rotary_emb: torch.Tensor | None,
         gdn_state: GdnArState | None = None,
+        conv_state: ConvArState | None = None,
     ) -> torch.Tensor:
         """Main-branch only GDN forward with output_gate + proj applied."""
-        raw, _ = self._forward_gdn_raw(hidden_states, spatial_shape, rotary_emb, gdn_state=gdn_state)
+        raw, _ = self._forward_gdn_raw(
+            hidden_states, spatial_shape, rotary_emb, gdn_state=gdn_state, conv_state=conv_state
+        )
         return self._apply_output_gate_and_proj(raw, hidden_states)
 
     def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -1286,8 +1371,38 @@ class SanaWmSelfAttention(nn.Module):
             query = query.bfloat16()
             key = key.bfloat16()
             value = value.bfloat16()
-        attn = F.scaled_dot_product_attention(query, key, value)
+        # Chunk-causal mask on the non-AR full/prefix forward only (softmax_state is
+        # None). The AR windowed path leaves this off -- the cache enforces
+        # causality, matching upstream's ``need_chunk_mask=False`` cached path.
+        attn_bias = None
+        if softmax_state is None and _REFERENCE_CHUNK_BOUNDARIES is not None:
+            attn_bias = self._chunk_causal_attn_bias(
+                spatial_shape, _REFERENCE_CHUNK_BOUNDARIES, key.device, key.dtype
+            )
+        attn = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_bias)
         return attn.transpose(1, 2).reshape(batch_size, token_count, q_size).to(dtype_orig)
+
+    @staticmethod
+    def _chunk_causal_attn_bias(
+        spatial_shape: tuple[int, int, int],
+        chunk_boundaries: list[int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Additive SDPA bias for chunk-causal softmax (mirrors upstream
+        ``_get_chunk_causal_mask``): 0 where a query token's chunk >= a key
+        token's chunk, ``-inf`` otherwise. Shape ``(1, 1, N, N)``.
+        """
+        frames, height, width = spatial_shape
+        spatial_tokens = height * width
+        frame_to_chunk = torch.zeros(frames, device=device, dtype=torch.long)
+        for i in range(len(chunk_boundaries) - 1):
+            frame_to_chunk[chunk_boundaries[i] : chunk_boundaries[i + 1]] = i
+        token_to_chunk = frame_to_chunk.repeat_interleave(spatial_tokens)
+        allowed = token_to_chunk.unsqueeze(1) >= token_to_chunk.unsqueeze(0)  # (N, N)
+        bias = torch.zeros(allowed.shape, device=device, dtype=dtype)
+        bias.masked_fill_(~allowed, float("-inf"))
+        return bias.unsqueeze(0).unsqueeze(0)
 
     def _forward_softmax_cam_branch(
         self,
@@ -1518,6 +1633,7 @@ class SanaWmSelfAttention(nn.Module):
         rotary_emb: torch.Tensor | None,
         *,
         precomputed_gates: tuple[torch.Tensor, torch.Tensor],
+        conv_state: ConvArState | None = None,
     ) -> torch.Tensor:
         """UCPE camera branch — matches the NVlabs production
         ``BidirectionalGDNUCPESinglePathLiteLABothTriton`` variant declared
@@ -1570,13 +1686,21 @@ class SanaWmSelfAttention(nn.Module):
         k_cam = _linear_output(self.k_proj_cam(hidden_states))
         v_cam = _linear_output(self.v_proj_cam(hidden_states))
 
-        # 2. Short conv on K (and optionally Q, V).
+        # 2. Short conv on K (and optionally Q, V) -- same AR chunk carry as the
+        # main branch, with per-projection slots (the release uses k_conv_only, so
+        # only conv_k_cam is present).
         if self.conv_k_cam is not None:
-            k_cam = self._bidirectional_temporal_short_conv(k_cam, self.conv_k_cam, spatial_shape)
+            k_cam = self._bidirectional_temporal_short_conv(
+                k_cam, self.conv_k_cam, spatial_shape, conv_state=conv_state, slot="k_cam"
+            )
         if self.conv_q_cam is not None:
-            q_cam = self._bidirectional_temporal_short_conv(q_cam, self.conv_q_cam, spatial_shape)
+            q_cam = self._bidirectional_temporal_short_conv(
+                q_cam, self.conv_q_cam, spatial_shape, conv_state=conv_state, slot="q_cam"
+            )
         if self.conv_v_cam is not None:
-            v_cam = self._bidirectional_temporal_short_conv(v_cam, self.conv_v_cam, spatial_shape)
+            v_cam = self._bidirectional_temporal_short_conv(
+                v_cam, self.conv_v_cam, spatial_shape, conv_state=conv_state, slot="v_cam"
+            )
 
         # 3-6. Fused cam-prep semantics: RMSNorm/ReLU/K-scale, UCPE
         # projection, RoPE, and K inflation tracking. Outputs already use
@@ -1649,6 +1773,7 @@ class SanaWmSelfAttention(nn.Module):
         camera_conditions: torch.Tensor | None = None,
         gdn_state: GdnArState | None = None,
         softmax_state: SoftmaxKvState | None = None,
+        conv_state: ConvArState | None = None,
     ) -> torch.Tensor:
         """Forward with dual-branch GDN+UCPE when ``camera_conditions`` is
         provided, otherwise main-branch-only GDN or softmax fallback.
@@ -1663,11 +1788,11 @@ class SanaWmSelfAttention(nn.Module):
             if camera_conditions is None or self.q_proj_cam is None:
                 # Main branch only — preserves legacy path when the request
                 # has no camera info or the cam projections were not built.
-                return self._forward_gdn(hidden_states, spatial_shape, rotary_emb, gdn_state)
+                return self._forward_gdn(hidden_states, spatial_shape, rotary_emb, gdn_state, conv_state)
             # Dual-branch: precompute β/decay once, run main raw, cam raw,
             # combine, then apply shared output_gate + proj exactly once.
-            # The camera branch is stateless (cam_scan carries no state), so only
-            # the main branch threads gdn_state.
+            # The GDN recurrence is stateless on the cam side (cam_scan carries no
+            # state), but both branches' K short-convs carry conv_state.
             beta, decay = self._compute_frame_gates(hidden_states, spatial_shape)
             main_raw, _ = self._forward_gdn_raw(
                 hidden_states,
@@ -1675,6 +1800,7 @@ class SanaWmSelfAttention(nn.Module):
                 rotary_emb,
                 precomputed_gates=(beta, decay),
                 gdn_state=gdn_state,
+                conv_state=conv_state,
             )
             cam_raw = self._forward_cam_branch(
                 hidden_states,
@@ -1682,6 +1808,7 @@ class SanaWmSelfAttention(nn.Module):
                 camera_conditions,
                 rotary_emb,
                 precomputed_gates=(beta, decay),
+                conv_state=conv_state,
             )
             cam_contrib = _linear_output(self.out_proj_cam(cam_raw))
             cam_contrib = self._match_local_inner_dim(cam_contrib, main_raw)
@@ -1880,7 +2007,12 @@ class SanaWmMbConvFfn(nn.Module):
             bias=False,
         )
 
-    def forward(self, hidden_states: torch.Tensor, spatial_shape: tuple[int, int, int]) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        spatial_shape: tuple[int, int, int],
+        conv_state: ConvArState | None = None,
+    ) -> torch.Tensor:
         """Match NVlabs ``GLUMBConvTemp.forward`` exactly:
 
         1. Reshape ``(B, N=F*H*W, C) → (B*F, H, W, C) → (B*F, C, H, W)``
@@ -1923,11 +2055,38 @@ class SanaWmMbConvFfn(nn.Module):
         x = x_pt
         # Temporal aggregation: (B*F, C, H, W) → (B, F, C, H*W) → (B, C, F, H*W)
         x_temporal = x.reshape(batch, frames, hidden_size, spatial_tokens).permute(0, 2, 1, 3)
-        t_conv_out = self.t_conv(x_temporal)
+        t_conv_out = self._temporal_conv(x_temporal, conv_state)
         x_temporal = x_temporal + t_conv_out
         # → (B, F, H*W, C) → (B, N, C)
         final = x_temporal.permute(0, 2, 3, 1).reshape(batch, frames * spatial_tokens, hidden_size).contiguous()
         return final
+
+    def _temporal_conv(self, x_temporal: torch.Tensor, conv_state: ConvArState | None) -> torch.Tensor:
+        """Apply the FFN temporal conv over ``(B, C, F, H*W)``.
+
+        Production path: the ``(t_padding, 0)`` symmetric zero-pad built into
+        ``t_conv``. Autoregressive path (upstream ``CachedGLUMBConvTemp``, slot 9):
+        replace the *leading* zero-pad with the previous chunk's trailing
+        ``t_padding`` frames and drop the prepended outputs; the trailing edge
+        keeps the conv's own zeros, so it is causal across chunks. The trailing
+        ``t_padding`` frames of this chunk's input are recorded for the next one.
+        """
+        if conv_state is None:
+            plain: torch.Tensor = self.t_conv(x_temporal)
+            return plain
+        # kernel_size[0] // 2 == the built-in symmetric t_padding (an int; unlike
+        # ``padding`` the kernel size is never the "same"/"valid" string form).
+        pad = self.t_conv.kernel_size[0] // 2
+        block_idx = getattr(self, "block_idx", 0)
+        if conv_state.capture and pad > 0:
+            conv_state.final[(block_idx, "ffn_t")] = x_temporal[:, :, x_temporal.shape[2] - pad :, :].detach().clone()
+        seed = conv_state.seed_for(block_idx, "ffn_t")
+        if seed is None or pad == 0:
+            unseeded: torch.Tensor = self.t_conv(x_temporal)
+            return unseeded
+        seeded = torch.cat([seed.to(x_temporal.dtype), x_temporal], dim=2)
+        out: torch.Tensor = self.t_conv(seeded)[:, :, seed.shape[2] :]
+        return out
 
 
 class SanaWmBlock(nn.Module):
@@ -2001,6 +2160,7 @@ class SanaWmBlock(nn.Module):
         encoder_attention_mask: torch.Tensor | None = None,
         gdn_state: GdnArState | None = None,
         softmax_state: SoftmaxKvState | None = None,
+        conv_state: ConvArState | None = None,
     ) -> torch.Tensor:
         # NVlabs dispatch convention: when timestep
         # modulation carries a frame axis (ndim > 2), route through the
@@ -2017,13 +2177,16 @@ class SanaWmBlock(nn.Module):
                 encoder_attention_mask,
                 gdn_state,
                 softmax_state,
+                conv_state,
             )
         batch_size = hidden_states.shape[0]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.scale_shift_table[None] + timestep_modulation.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
         attn_input = self._modulate(self.norm1(hidden_states), shift_msa, scale_msa)
-        attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_conditions, gdn_state, softmax_state)
+        attn_output = self.attn(
+            attn_input, spatial_shape, rotary_emb, camera_conditions, gdn_state, softmax_state, conv_state
+        )
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         hidden_states = hidden_states + gate_msa * attn_output
@@ -2033,7 +2196,7 @@ class SanaWmBlock(nn.Module):
             encoder_attention_mask,
         )
         mlp_input = self._modulate(self.norm2(hidden_states), shift_mlp, scale_mlp)
-        hidden_states = hidden_states + gate_mlp * self.mlp(mlp_input, spatial_shape)
+        hidden_states = hidden_states + gate_mlp * self.mlp(mlp_input, spatial_shape, conv_state)
         return hidden_states
 
     def _forward_frame_aware(
@@ -2048,6 +2211,7 @@ class SanaWmBlock(nn.Module):
         encoder_attention_mask: torch.Tensor | None = None,
         gdn_state: GdnArState | None = None,
         softmax_state: SoftmaxKvState | None = None,
+        conv_state: ConvArState | None = None,
     ) -> torch.Tensor:
         """Per-frame timestep modulation path matching NVlabs
         ``SanaVideoMSCamCtrlBlock.forward_frame_aware``.
@@ -2078,7 +2242,9 @@ class SanaWmBlock(nn.Module):
         # scale/shift over the spatial axis, then flattening back.
         x_norm1 = self.norm1(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_msa_in = (x_norm1 * (1 + scale_msa) + shift_msa).reshape(batch_size, token_count, hidden_size)
-        attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, camera_conditions, gdn_state, softmax_state)
+        attn_output = self.attn(
+            x_msa_in, spatial_shape, rotary_emb, camera_conditions, gdn_state, softmax_state, conv_state
+        )
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         attn_output_4d = attn_output.reshape(batch_size, frames, spatial_tokens, hidden_size)
@@ -2092,7 +2258,7 @@ class SanaWmBlock(nn.Module):
 
         x_norm2 = self.norm2(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_mlp_in = (x_norm2 * (1 + scale_mlp) + shift_mlp).reshape(batch_size, token_count, hidden_size)
-        mlp_out = self.mlp(x_mlp_in, spatial_shape)
+        mlp_out = self.mlp(x_mlp_in, spatial_shape, conv_state)
         mlp_out_4d = mlp_out.reshape(batch_size, frames, spatial_tokens, hidden_size)
         hidden_states = hidden_states + (gate_mlp * mlp_out_4d).reshape(batch_size, token_count, hidden_size)
         return hidden_states
@@ -2410,6 +2576,7 @@ class SanaWmTransformer3DModel(nn.Module):
         spatial_raymap: torch.Tensor | None = None,
         gdn_state: GdnArState | None = None,
         softmax_state: SoftmaxKvState | None = None,
+        conv_state: ConvArState | None = None,
         frame_offset: int = 0,
     ) -> torch.Tensor:
         if hidden_states.ndim != 5:
@@ -2545,6 +2712,7 @@ class SanaWmTransformer3DModel(nn.Module):
                 encoder_attention_mask,
                 gdn_state,
                 softmax_state,
+                conv_state,
             )
 
         hidden_states = self.final_layer(hidden_states, time_embed.to(hidden_states.dtype), spatial_shape)
