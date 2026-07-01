@@ -236,6 +236,8 @@ def fused_bigdn_func(
     init_state_kv: torch.Tensor | None = None,
     init_state_z: torch.Tensor | None = None,
     return_final_state: bool = False,
+    beta_bwd: torch.Tensor | None = None,
+    decay_bwd: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bidirectional fused GDN. Returns ``(B, N, H, D)``.
 
@@ -244,6 +246,8 @@ def fused_bigdn_func(
     autoregressive decoding, ``init_state_kv``/``init_state_z`` seed the forward
     scan and ``return_final_state`` additionally returns the carryable
     ``(state_kv, state_z)`` (the chunkwise op already supports this contract).
+    ``beta_bwd``/``decay_bwd`` carry chunk-causal reverse-scan gates (see
+    :func:`fused_bigdn_bidi_chunkwise`).
     """
 
     return fused_bigdn_bidi_chunkwise(
@@ -263,6 +267,8 @@ def fused_bigdn_func(
         init_state_kv=init_state_kv,
         init_state_z=init_state_z,
         return_final_state=return_final_state,
+        beta_bwd=beta_bwd,
+        decay_bwd=decay_bwd,
     )
 
 
@@ -1643,10 +1649,21 @@ def fused_bigdn_bidi_chunkwise(
     init_state_kv=None,
     init_state_z=None,
     return_final_state=False,
+    beta_bwd=None,
+    decay_bwd=None,
 ):
     """Bidi chunkwise GDN forward, optionally with state-cache for autoregressive
     sampling (chunk 0 = full bidi with state save; chunks > 0 seed forward scan
     from saved state). Reverse always seeds from zero per upstream convention.
+
+    When ``beta_bwd``/``decay_bwd`` are given (chunk-causal forward: reverse-scan
+    gates zeroed at interior chunk boundaries), the forward+reverse scans use
+    different gates and cannot share the fused ``combined_history`` Phase B, so
+    this falls back to the two-scan path (Phase A/B/C forward + Phase A/B/C
+    reverse, then combine) -- the exact analogue of upstream's
+    ``fused_gdn.fused_bigdn_func`` ``*_bwd`` extension. This path does not support
+    ``return_final_state`` / ``init_state_*`` (AR carry runs one chunk per forward,
+    where no interior boundary exists so ``beta_bwd`` is ``None``).
 
     Pipeline (2026-04-25 restructure): Phase A once → Phase B direction=0 with
     combined_history=True (fwd seeded with init_state and saves final state;
@@ -1658,6 +1675,47 @@ def fused_bigdn_bidi_chunkwise(
     Replaces the prior 2× Phase B + 2× Phase C pattern. Saves one Phase C
     launch + one Q+RoPE HBM pass and one M-shape buffer per call.
     """
+    if beta_bwd is not None or decay_bwd is not None:
+        if return_final_state or init_state_kv is not None or init_state_z is not None:
+            raise NotImplementedError(
+                "fused_bigdn_bidi_chunkwise: chunk-causal reverse gates (beta_bwd/decay_bwd) "
+                "are incompatible with return_final_state / init_state_* (AR carry)."
+            )
+        beta_b = beta if beta_bwd is None else beta_bwd
+        decay_b = decay if decay_bwd is None else decay_bwd
+        # Forward scan (unmasked gates: causal context flows across chunks).
+        I_P_kv_f, A_f, I_P_z_f, B_f = phase_a(
+            qkv, beta, q_inv_rms, k_inv_rms, q_norm_w, k_norm_w, rope_cos, rope_sin,
+            F=F, S=S, k_scale=k_scale, norm_eps=norm_eps, dot_precision=dot_precision,
+        )
+        M_f, z_f, _, _ = phase_b_triton(
+            I_P_kv_f, A_f, I_P_z_f, B_f, decay, F=F, dot_precision=dot_precision, direction=1
+        )
+        num_f, den_f = phase_c(
+            qkv, q_inv_rms, q_norm_w, rope_cos, rope_sin, M_f, z_f,
+            F=F, S=S, dot_precision=dot_precision,
+        )
+        # Reverse scan (gates zeroed at interior chunk boundaries: anti-causal
+        # state resets per chunk, so no future context leaks across boundaries).
+        I_P_kv_b, A_b, I_P_z_b, B_b = phase_a(
+            qkv, beta_b, q_inv_rms, k_inv_rms, q_norm_w, k_norm_w, rope_cos, rope_sin,
+            F=F, S=S, k_scale=k_scale, norm_eps=norm_eps, dot_precision=dot_precision,
+        )
+        _, _, M_b, z_b = phase_b_triton(
+            I_P_kv_b, A_b, I_P_z_b, B_b, decay_b, F=F, dot_precision=dot_precision, direction=2
+        )
+        num_b, den_b = phase_c(
+            qkv, q_inv_rms, q_norm_w, rope_cos, rope_sin, M_b, z_b,
+            F=F, S=S, dot_precision=dot_precision,
+        )
+        # Phase C is linear in (M, z): Q @ (M_fwd + M_rev) = Q @ M_fwd + Q @ M_rev,
+        # so summing the two directions' num/den is exact (matches upstream).
+        num_out = num_f + num_b
+        den_out = den_f + den_b
+        total_den = den_out.float().permute(0, 2, 1).unsqueeze(-1)  # (B, N, H, 1)
+        out = (num_out.float() / (total_den + eps)).to(qkv.dtype)
+        return out
+
     I_P_kv, A, I_P_z, B_z = phase_a(
         qkv,
         beta,
@@ -2021,6 +2079,8 @@ def reference_bidirectional_gated_delta_net(
     spatial_tokens: int,
     query_rot: torch.Tensor | None = None,
     key_rot: torch.Tensor | None = None,
+    beta_bwd: torch.Tensor | None = None,
+    decay_bwd: torch.Tensor | None = None,
     eps: float = 1e-8,
     init_state_kv: torch.Tensor | None = None,
     init_state_z: torch.Tensor | None = None,
@@ -2031,6 +2091,12 @@ def reference_bidirectional_gated_delta_net(
     Inputs follow the layout used by the official Stage-1 operator:
     ``query/key/value/query_rot/key_rot`` are ``[B, H, D, T*S]``, ``beta`` is
     ``[B, H, T, S]``, and ``decay`` is ``[B, H, T]``.
+
+    ``beta_bwd``/``decay_bwd`` are the reverse-direction gates for chunk-causal
+    forwards: they are ``beta``/``decay`` with the anti-causal state reset at the
+    interior chunk-boundary frames (mirrors upstream
+    ``_mask_reverse_gates_for_chunk_boundaries``). When ``None`` the reverse scan
+    reuses the forward gates (fully bidirectional).
 
     For autoregressive (chunk-causal) decoding, ``init_state_kv``/``init_state_z``
     seed the **forward** scan from the previous chunk's terminal state; the
@@ -2060,6 +2126,8 @@ def reference_bidirectional_gated_delta_net(
     key_rot = key_rot.float()
     beta = beta.float()
     decay = decay.float()
+    beta_bwd = beta_bwd.float() if beta_bwd is not None else beta
+    decay_bwd = decay_bwd.float() if decay_bwd is not None else decay
 
     fwd_init_kv = init_state_kv.float() if init_state_kv is not None else None
     fwd_init_z = init_state_z.float() if init_state_z is not None else None
@@ -2098,8 +2166,8 @@ def reference_bidirectional_gated_delta_net(
         from_time(_flip_and_shift(value_t, dim=2, shift_value=0.0)),
         from_time(torch.flip(query_rot_t, dims=[2])),
         from_time(_flip_and_shift(key_rot_t, dim=2, shift_value=0.0)),
-        _flip_and_shift(beta, dim=2, shift_value=0.0),
-        _flip_and_shift(decay, dim=2, shift_value=1.0),
+        _flip_and_shift(beta_bwd, dim=2, shift_value=0.0),
+        _flip_and_shift(decay_bwd, dim=2, shift_value=1.0),
         spatial_tokens=spatial_tokens,
     )
 
@@ -2137,6 +2205,8 @@ def triton_bidirectional_gated_delta_net_from_qkv(
     init_state_kv: torch.Tensor | None = None,
     init_state_z: torch.Tensor | None = None,
     return_final_state: bool = False,
+    beta_bwd: torch.Tensor | None = None,
+    decay_bwd: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the fused NVlabs bidirectional GDN kernel from raw QKV.
 
@@ -2144,6 +2214,9 @@ def triton_bidirectional_gated_delta_net_from_qkv(
       qkv: ``[B, N, 3, H, D]`` raw projected Q/K/V after temporal K-conv.
       beta: ``[B, H, T, S]`` token gates.
       decay: ``[B, H, T]`` per-frame decay.
+      beta_bwd/decay_bwd: optional ``[B, H, T, S]`` / ``[B, H, T]`` reverse-scan
+        gates for chunk-causal forwards (zeroed at interior chunk boundaries).
+        When given the kernel runs the two-scan path (forward + masked reverse).
 
     Returns:
       Tensor shaped ``[B, H, D, N]`` to match
@@ -2178,6 +2251,8 @@ def triton_bidirectional_gated_delta_net_from_qkv(
             "Sana-WM fused GDN decay shape mismatch: expected "
             f"{(batch_size, num_heads, frames)}, got {tuple(decay.shape)}."
         )
+    if (beta_bwd is None) != (decay_bwd is None):
+        raise ValueError("Sana-WM fused GDN: beta_bwd and decay_bwd must be provided together.")
 
     qkv = qkv.contiguous()
     # q_norm is a vLLM RMSNorm on the production path, which stores its epsilon
@@ -2205,6 +2280,8 @@ def triton_bidirectional_gated_delta_net_from_qkv(
         init_state_kv=init_state_kv,
         init_state_z=init_state_z,
         return_final_state=return_final_state,
+        beta_bwd=None if beta_bwd is None else beta_bwd.contiguous(),
+        decay_bwd=None if decay_bwd is None else decay_bwd.contiguous(),
     )
     if return_final_state:
         assert isinstance(result, tuple)

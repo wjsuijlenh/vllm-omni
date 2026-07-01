@@ -725,6 +725,11 @@ class SanaWmSelfAttention(nn.Module):
         self.in_dim = hidden_size
         self.out_dim = hidden_size
         self.eps = 1e-8
+        # Intra-forward chunk-causal split (matches upstream ChunkCausalGDN). The
+        # anti-causal (backward) temporal short-conv and the GDN reverse scan must
+        # not leak across chunk boundaries within a single forward. ``0`` disables
+        # it (fully bidirectional -- the pre-fix behaviour).
+        self.chunk_size = int(getattr(config, "chunk_size", 0) or 0)
         self.attn_type = config.attn_type
         self.use_gdn = use_gdn and "GDN" in config.attn_type
         self.use_vllm_attention = (not self.use_gdn) and _vllm_attention_available()
@@ -1023,9 +1028,10 @@ class SanaWmSelfAttention(nn.Module):
         hidden_states, batch_size, spatial_tokens, frames = self._reshape_to_temporal(hidden_states, spatial_shape)
         # Autoregressive chunk carry (upstream cached ShortConv, slot 4): seed the
         # forward pass with the previous chunk's trailing frames and record this
-        # chunk's own trailing frames. The backward pass stays per-chunk (its
-        # cross-chunk context would be future frames, which are never cached), so
-        # it keeps the zero-pad -- causal across chunk boundaries.
+        # chunk's own trailing frames. The forward causal conv looks back across
+        # chunk boundaries (past context, causal) exactly like upstream; the
+        # backward (anti-causal) conv must NOT leak across chunk boundaries, so it
+        # is run independently within each chunk (see _backward_conv_per_chunk).
         left_context: torch.Tensor | None = None
         if conv_state is not None:
             block_idx = getattr(self, "block_idx", 0)
@@ -1034,11 +1040,74 @@ class SanaWmSelfAttention(nn.Module):
             if conv_state.capture and pad > 0:
                 conv_state.final[(block_idx, slot)] = hidden_states[:, frames - pad :, :].detach().clone()
         forward_states = self._causal_conv_1d(hidden_states, conv, left_context)
-        backward_states = self._causal_conv_1d(hidden_states.flip(1), conv).flip(1)
+        backward_states = self._backward_conv_per_chunk(hidden_states, conv, frames)
         center_weight = conv.weight[:, 0, -1].to(hidden_states.dtype)
         center_states = hidden_states * center_weight.view(1, 1, -1)
         output = forward_states + backward_states - center_states
         return self._reshape_from_temporal(output, batch_size, spatial_tokens, frames)
+
+    @staticmethod
+    def _chunk_bounds(frames: int, chunk_size: int) -> list[tuple[int, int]]:
+        """Intra-forward chunk spans. The first chunk absorbs the remainder and
+        later chunks are exactly ``chunk_size`` -- matching upstream's
+        ``first_chunk_plus_one`` split for the anchor+multiple frame counts the
+        model runs (e.g. frames=7, chunk_size=3 -> [(0,4),(4,7)]). ``chunk_size<=0``
+        or a single-chunk sequence yields one span (fully bidirectional)."""
+        if chunk_size <= 0 or frames <= chunk_size:
+            return [(0, frames)]
+        remainder = frames % chunk_size
+        num_chunks = frames // chunk_size
+        bounds: list[tuple[int, int]] = []
+        start = 0
+        for i in range(num_chunks):
+            end = start + chunk_size + (remainder if i == 0 else 0)
+            bounds.append((start, end))
+            start = end
+        return bounds
+
+    def _backward_conv_per_chunk(self, hidden_states: torch.Tensor, conv: nn.Conv1d, frames: int) -> torch.Tensor:
+        """Anti-causal temporal short-conv run independently within each chunk so it
+        never leaks across chunk boundaries (port of upstream
+        ``ChunkCausalGDN._backward_causal_conv_per_chunk``). ``hidden_states`` is in
+        temporal layout ``(B', frames, C)`` with the frame axis at dim 1. Reduces to
+        the plain full-sequence backward when there is a single chunk."""
+        bounds = self._chunk_bounds(frames, self.chunk_size)
+        if len(bounds) == 1:
+            return self._causal_conv_1d(hidden_states.flip(1), conv).flip(1)
+        out = torch.empty_like(hidden_states)
+        for start, end in bounds:
+            seg = hidden_states[:, start:end, :]
+            out[:, start:end, :] = self._causal_conv_1d(seg.flip(1), conv).flip(1)
+        return out
+
+    def _reverse_chunk_gates(
+        self,
+        beta: torch.Tensor,
+        decay: torch.Tensor,
+        frames: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Reverse-direction GDN gates for a chunk-causal forward.
+
+        Zeros ``beta`` and ``decay`` at each interior chunk boundary (the first
+        frame of every non-first chunk, plus any singleton-chunk frame) so the
+        anti-causal scan resets per chunk and no future context leaks across a
+        boundary. Port of upstream ``_mask_reverse_gates_for_chunk_boundaries``.
+        Returns ``(None, None)`` for a single chunk (fully bidirectional), which
+        keeps the fused single-scan (``combined_history``) fast path.
+
+        ``beta`` is ``[B, H, T, S]`` and ``decay`` is ``[B, H, T]``.
+        """
+        bounds = self._chunk_bounds(frames, self.chunk_size)
+        if len(bounds) == 1:
+            return None, None
+        zero_positions = sorted({s for s, _ in bounds if s > 0} | {s for s, e in bounds if e - s == 1})
+        if not zero_positions:
+            return None, None
+        beta_bwd = beta.clone()
+        decay_bwd = decay.clone()
+        beta_bwd[:, :, zero_positions, :] = 0.0
+        decay_bwd[:, :, zero_positions] = 0.0
+        return beta_bwd, decay_bwd
 
     def _compute_frame_gates(
         self,
@@ -1104,6 +1173,14 @@ class SanaWmSelfAttention(nn.Module):
         else:
             beta, decay = precomputed_gates
 
+        # Chunk-causal reverse-scan gates: the reference model splits each forward
+        # into chunks (first_chunk_plus_one) and runs the GDN anti-causal scan
+        # per-chunk, so the reverse direction resets at interior chunk boundaries.
+        # (AR chunk carry runs one chunk per forward -> single chunk -> None.)
+        beta_bwd = decay_bwd = None
+        if not capture:
+            beta_bwd, decay_bwd = self._reverse_chunk_gates(beta, decay, frames)
+
         if hidden_states.is_cuda:
             qkv = torch.stack(
                 (
@@ -1127,6 +1204,8 @@ class SanaWmSelfAttention(nn.Module):
                     init_state_kv=init_kv,
                     init_state_z=init_z,
                     return_final_state=capture,
+                    beta_bwd=beta_bwd,
+                    decay_bwd=decay_bwd,
                 )
                 if capture:
                     assert isinstance(fused, tuple) and gdn_state is not None
@@ -1177,6 +1256,8 @@ class SanaWmSelfAttention(nn.Module):
             spatial_tokens=spatial_tokens,
             query_rot=query_rot,
             key_rot=key_rot,
+            beta_bwd=beta_bwd,
+            decay_bwd=decay_bwd,
             eps=self.eps,
             init_state_kv=init_kv,
             init_state_z=init_z,

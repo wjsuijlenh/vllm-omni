@@ -93,6 +93,11 @@ class SanaWmConfig:
     use_chunk_plucker_post_attn: bool = True
     chunk_plucker_channels: int = 48
     chunk_plucker_post_attn_blocks: int = 20
+    # Intra-forward chunk-causal structure. ``chunk_size <= 0`` means "no
+    # intra-forward chunking" (fully bidirectional); the chunk_causal release
+    # ships ``chunk_size=3`` / ``chunk_split_strategy=first_chunk_plus_one``.
+    chunk_size: int = 0
+    chunk_split_strategy: str = "first_chunk_plus_one"
     inference_flow_shift: float = 9.8
     scheduler_type: str = "flow_dpm-solver"
     chi_prompt: list[str] = field(default_factory=list)
@@ -149,6 +154,8 @@ class SanaWmConfig:
             chunk_plucker_post_attn_blocks=int(
                 model_field("chunk_plucker_post_attn_blocks", cls.chunk_plucker_post_attn_blocks)
             ),
+            chunk_size=int(model_field("chunk_size", cls.chunk_size)),
+            chunk_split_strategy=str(model_field("chunk_split_strategy", cls.chunk_split_strategy)),
             inference_flow_shift=float(
                 _first_present(
                     scheduler_cfg.get("inference_flow_shift"),
