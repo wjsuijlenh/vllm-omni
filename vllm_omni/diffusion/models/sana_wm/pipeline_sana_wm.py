@@ -29,7 +29,9 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.sana_wm.ar_rollout import (
     autoregressive_segments,
     commit_chunk_state,
+    commit_conv_chunk,
     commit_softmax_window,
+    conv_step_state,
     slice_camera_frames,
     softmax_step_state,
     step_state,
@@ -943,13 +945,14 @@ class SanaWmPipeline(
         the next chunk -- the upstream ``save_kv_cache=True`` pass -- so the carry
         reflects the settled latent, not the last noisy step.
 
-        Known limitation (upstream "Fix 3" not yet wired): the 5 softmax-attention
-        blocks have no cross-chunk sliding-window KV cache here, so they attend
-        only within the active chunk. Temporal coherence across chunk seams
-        therefore rests on the GDN carry alone until the softmax window is threaded
-        through ``GdnArState``'s sibling cache. The GDN single-block carry is
-        GPU-validated; full-pipeline equivalence against the checkpoint is a later
-        step.
+        All three cross-chunk carries are threaded here: the GDN recurrent state
+        (``commit_chunk_state``), the softmax sink+sliding-window KV
+        (``commit_softmax_window``, bounded by ``sana_wm_ar_kv_window_frames``), and
+        the temporal-conv boundary state (``commit_conv_chunk``, toggle
+        ``sana_wm_ar_conv_carry``). The conv carry seeds each chunk's temporal
+        convolutions from the previous chunk's trailing frames instead of
+        zero-padding; without it the convs restart at every seam and inject a
+        visible per-chunk discontinuity in high-frequency detail.
         """
         params = self._native_params(payload, sampling_params)
         extra_args = self._extra_args(sampling_params)
@@ -1048,6 +1051,13 @@ class SanaWmPipeline(
         spatial_tokens = latent_height * latent_width
         window_frames = int(extra_args.get("sana_wm_ar_kv_window_frames", 10))
 
+        # Temporal-conv boundary carry: seed each chunk's temporal convolutions from
+        # the previous chunk's trailing conv-input frames instead of zero-padding.
+        # Without it the convs restart from zeros at every chunk seam, producing a
+        # visible per-chunk discontinuity in high-frequency detail. On by default;
+        # ``sana_wm_ar_conv_carry=False`` restores the zero-pad behaviour for A/B.
+        carry_conv = bool(extra_args.get("sana_wm_ar_conv_carry", True))
+
         spans = autoregressive_segments(latent_frames, chunk_size)
         for span in spans:
             # Contiguous, non-overlapping chunk: denoise only this chunk's own
@@ -1080,6 +1090,20 @@ class SanaWmPipeline(
                 else None
             )
 
+            # Conv seeds for the noisy steps: read-only (the trailing frames are only
+            # captured on the clean pass), so build once per chunk and reuse -- same
+            # lifecycle as the softmax seeds above.
+            cv_pos = (
+                conv_step_state(adapter, is_first_chunk=span.is_first, capture=False, is_negative=False)
+                if carry_conv
+                else None
+            )
+            cv_neg = (
+                conv_step_state(adapter, is_first_chunk=span.is_first, capture=False, is_negative=True)
+                if carry_conv and do_cfg
+                else None
+            )
+
             for timestep in timesteps:
                 model_timestep = timestep.float().expand(1, 1, cam_frames).clone()
                 if anchor_local is not None:
@@ -1098,6 +1122,7 @@ class SanaWmPipeline(
                     spatial_raymap=chunk_spatial,
                     gdn_state=pos_state,
                     softmax_state=sm_pos,
+                    conv_state=cv_pos,
                     frame_offset=span.start,
                 )
                 if do_cfg:
@@ -1112,6 +1137,7 @@ class SanaWmPipeline(
                         spatial_raymap=chunk_spatial,
                         gdn_state=neg_state,
                         softmax_state=sm_neg,
+                        conv_state=cv_neg,
                         frame_offset=span.start,
                     )
                     noise_pred = noise_pred_uncond + params.cfg_scale * (noise_pred_cond - noise_pred_uncond)
@@ -1143,6 +1169,11 @@ class SanaWmPipeline(
                 sm_clean_pos = softmax_step_state(
                     adapter, is_first_chunk=span.is_first, capture=True, is_negative=False
                 )
+                cv_clean_pos = (
+                    conv_step_state(adapter, is_first_chunk=span.is_first, capture=True, is_negative=False)
+                    if carry_conv
+                    else None
+                )
                 self.transformer(
                     chunk_latents,
                     clean_timestep,
@@ -1153,16 +1184,24 @@ class SanaWmPipeline(
                     spatial_raymap=chunk_spatial,
                     gdn_state=clean_pos,
                     softmax_state=sm_clean_pos,
+                    conv_state=cv_clean_pos,
                     frame_offset=span.start,
                 )
                 commit_chunk_state(adapter, clean_pos, is_negative=False)
                 commit_softmax_window(
                     adapter, sm_clean_pos, spatial_tokens=spatial_tokens, window_frames=window_frames, is_negative=False
                 )
+                if cv_clean_pos is not None:
+                    commit_conv_chunk(adapter, cv_clean_pos, is_negative=False)
                 if do_cfg:
                     clean_neg = step_state(adapter, is_first_chunk=span.is_first, capture=True, is_negative=True)
                     sm_clean_neg = softmax_step_state(
                         adapter, is_first_chunk=span.is_first, capture=True, is_negative=True
+                    )
+                    cv_clean_neg = (
+                        conv_step_state(adapter, is_first_chunk=span.is_first, capture=True, is_negative=True)
+                        if carry_conv
+                        else None
                     )
                     self.transformer(
                         chunk_latents,
@@ -1174,6 +1213,7 @@ class SanaWmPipeline(
                         spatial_raymap=chunk_spatial,
                         gdn_state=clean_neg,
                         softmax_state=sm_clean_neg,
+                        conv_state=cv_clean_neg,
                         frame_offset=span.start,
                     )
                     commit_chunk_state(adapter, clean_neg, is_negative=True)
@@ -1184,6 +1224,8 @@ class SanaWmPipeline(
                         window_frames=window_frames,
                         is_negative=True,
                     )
+                    if cv_clean_neg is not None:
+                        commit_conv_chunk(adapter, cv_clean_neg, is_negative=True)
 
             adapter.chunk_index = span.index + 1
 
