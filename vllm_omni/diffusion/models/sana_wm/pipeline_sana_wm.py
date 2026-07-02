@@ -999,7 +999,15 @@ class SanaWmPipeline(
         )
         latents = torch.cat([first_latent, noise[:, :, 1:]], dim=2)
 
-        scheduler = SanaWmFlowMatchScheduler(params.num_inference_steps, shift=self.sana_wm_config.inference_flow_shift)
+        # Distilled self-forcing student: an explicit few-step timestep schedule
+        # (e.g. ``[1000, 960, 889, 727, 0]``) replaces the uniform shift schedule.
+        # ``None`` keeps the teacher's uniform ``num_inference_steps`` path.
+        denoising_step_list = extra_args.get("sana_wm_ar_denoising_step_list")
+        scheduler = SanaWmFlowMatchScheduler(
+            params.num_inference_steps,
+            shift=self.sana_wm_config.inference_flow_shift,
+            denoising_step_list=denoising_step_list,
+        )
         timesteps = scheduler.timesteps(device=device)
 
         allow_hash_fallback = bool(extra_args.get("sana_wm_hash_prompt_fallback", False))
@@ -1059,6 +1067,16 @@ class SanaWmPipeline(
         carry_conv = bool(extra_args.get("sana_wm_ar_conv_carry", True))
 
         spans = autoregressive_segments(latent_frames, chunk_size)
+
+        # Softmax-window sink policy. The teacher default anchors a single frame
+        # (frame 0). The distilled streaming student anchors the WHOLE first chunk
+        # (upstream ``sink_num = chunk_indices[1] - chunk_indices[0]``); set
+        # ``sana_wm_ar_sink_first_chunk=True`` to match it, or pin an explicit count
+        # with ``sana_wm_ar_sink_frames``.
+        sink_frames = int(extra_args.get("sana_wm_ar_sink_frames", 1))
+        if bool(extra_args.get("sana_wm_ar_sink_first_chunk", False)) and spans:
+            sink_frames = spans[0].num_frames
+
         for span in spans:
             # Contiguous, non-overlapping chunk: denoise only this chunk's own
             # frames (no re-fed previous frame). Cross-chunk context for the GDN
@@ -1189,7 +1207,12 @@ class SanaWmPipeline(
                 )
                 commit_chunk_state(adapter, clean_pos, is_negative=False)
                 commit_softmax_window(
-                    adapter, sm_clean_pos, spatial_tokens=spatial_tokens, window_frames=window_frames, is_negative=False
+                    adapter,
+                    sm_clean_pos,
+                    spatial_tokens=spatial_tokens,
+                    window_frames=window_frames,
+                    sink_frames=sink_frames,
+                    is_negative=False,
                 )
                 if cv_clean_pos is not None:
                     commit_conv_chunk(adapter, cv_clean_pos, is_negative=False)
@@ -1222,6 +1245,7 @@ class SanaWmPipeline(
                         sm_clean_neg,
                         spatial_tokens=spatial_tokens,
                         window_frames=window_frames,
+                        sink_frames=sink_frames,
                         is_negative=True,
                     )
                     if cv_clean_neg is not None:

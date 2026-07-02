@@ -31,7 +31,23 @@ class SanaWmFlowMatchScheduler:
         self,
         num_inference_steps: int,
         shift: float = SANA_WM_DEFAULT_INFERENCE_FLOW_SHIFT,
+        denoising_step_list: list[int] | None = None,
     ) -> None:
+        # Distilled self-forcing student path: an explicit integer timestep
+        # schedule (e.g. ``[1000, 960, 889, 727, 0]``) taken verbatim, the way
+        # NVlabs' streaming sampler builds a ``FlowMatchEulerDiscreteScheduler
+        # (shift=1.0)`` from ``set_timesteps(sigmas=[t/1000 for t in list[:-1]])``.
+        # When supplied it bypasses the ``shift`` linspace entirely; ``shift`` is
+        # then irrelevant. The list must end with the terminal ``0``.
+        self._explicit_steps: list[int] | None = None
+        if denoising_step_list is not None:
+            steps = [int(t) for t in denoising_step_list]
+            if len(steps) < 2 or steps[-1] != 0:
+                raise ValueError(
+                    "Sana-WM denoising_step_list must have >=2 entries and end with 0; " f"got {steps}."
+                )
+            self._explicit_steps = steps
+            num_inference_steps = len(steps) - 1
         if num_inference_steps <= 0:
             raise ValueError("Sana-WM scheduler num_inference_steps must be positive.")
         self.num_inference_steps = num_inference_steps
@@ -54,6 +70,17 @@ class SanaWmFlowMatchScheduler:
         # sigmas = shift * sig_pre / (1 + (shift-1) * sig_pre)   <-- second shift
         # timesteps = sigmas * num_train
         # sigmas = cat([sigmas, 0])
+        if self._explicit_steps is not None:
+            # Verbatim distilled schedule: timesteps = list[:-1], sigmas = t/1000,
+            # with the terminal 0 appended (mirrors set_timesteps(sigmas=...) at
+            # shift=1.0). No double-shift, no linspace.
+            steps = [float(t) for t in self._explicit_steps[:-1]]
+            timesteps = torch.tensor(steps, dtype=torch.float32, device=device)
+            sigmas = timesteps / float(self.num_train_timesteps)
+            self._timesteps_tensor = timesteps
+            self._sigmas_tensor = torch.cat([sigmas, torch.zeros(1, dtype=torch.float32, device=device)])
+            return
+
         N = self.num_inference_steps
         ts_pre = torch.linspace(
             float(self.num_train_timesteps),
