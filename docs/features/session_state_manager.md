@@ -158,3 +158,30 @@ of `num_frame_per_block` frames instead: identical output, bounded memory, and
 the per-step quantisation no longer scales with session length. Asking for more
 frames than the ring retains raises rather than silently returning a shorter
 window. The bespoke path is unchanged.
+
+### Lingbot-World-Fast
+
+Lingbot's growing memory all lives in the AR-Diffusion engine's paged pool: the
+self-attention KV that grows with every generated chunk, and the text
+cross-attention K/V written once per session and reread. The manager covers the
+pipeline-held remainder, which is carried metadata only — so this integration
+declares **no `StateObject` at all**, the recorded decision the rule above
+allows. It is the counterpart of the DreamZero example: there the rule kept a
+603 MiB cache *out* of a `StateObject`; here it keeps the whole session in
+`attrs`, because nothing the pipeline holds accumulates or can be released
+mid-session without changing the output.
+
+| Value | Bucket | Size | Notes |
+|---|---|---|---|
+| `last_decoded_latent` | `attrs` | ~1 MiB | The previous call's last two latents, kept on the GPU to warm the VAE decoder's temporal caches on the next extension call. Replaced wholesale each call. |
+| `local_end_index`, `global_end_index` | `attrs` | tiny | Per-layer attention end-index tensors, mutated in place by the transformer during forward. |
+| `h`, `w`, `lat_h`, `lat_w`, `frame_seqlen` | `attrs` | — | Shape constants captured on the first call and reused on extension calls. |
+| `current_lat_f`, `current_start_frame`, `session_id`, flags | `attrs` | — | Counters and the fresh-versus-extension marker. |
+
+The retained-session cap defaults to **1**, mirroring the bespoke pipeline,
+which keeps exactly one session's state alive at a time — a session displaced
+by another restarts, on either path. Raising
+`OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS` retains several sessions'
+pipeline state for interleaved-extension experiments; the pipeline's
+extension-call sync check still refuses to extend a session whose engine KV is
+gone, so the override cannot produce a silently context-free continuation.

@@ -25,6 +25,13 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportCameraPosInput, SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.experimental.world_models.adapters.state_lingbot_world_fast_adapter import (
+    LingbotWorldFastStateAdapter,
+)
+from vllm_omni.experimental.world_models.session_state import (
+    SessionStateManager,
+    resolve_session_state_config,
+)
 
 from .cam_utils import (
     compute_relative_poses,
@@ -38,6 +45,12 @@ from .state_lingbot_world_fast import LingbotWorldFastState
 from .wan_fast import WanModelFast
 
 logger = logging.getLogger(__name__)
+
+# The pipeline's per-session state is a bespoke ``LingbotWorldFastState`` by
+# default, or a ``LingbotWorldFastStateAdapter`` view when the opt-in session
+# state manager is enabled. The adapter mirrors the bespoke surface, so every
+# read and write below accepts either.
+LingbotWorldFastSessionState = LingbotWorldFastState | LingbotWorldFastStateAdapter
 
 CONFIG = {
     "num_train_timesteps": 1000,
@@ -153,7 +166,23 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
 
         self.sp_size = od_config.parallel_config.world_size
 
-        self.state = LingbotWorldFastState()
+        self.state: LingbotWorldFastSessionState = LingbotWorldFastState()
+        # Opt-in: back per-session state with the shared SessionStateManager
+        # (RFC #4480). Default off -> the bespoke LingbotWorldFastState above.
+        # The retained-session cap defaults to 1, matching the bespoke path,
+        # which keeps exactly one session's state alive at a time. The
+        # environment override can raise it to experiment with interleaved
+        # sessions; the extension-call sync check in forward() still guards
+        # against extending a session whose engine KV is gone.
+        use_state_manager, max_sessions = resolve_session_state_config(
+            enable=od_config.enable_session_state_manager,
+            max_sessions=1,
+        )
+        self._state_manager: SessionStateManager | None = (
+            SessionStateManager(max_sessions=max_sessions) if use_state_manager else None
+        )
+        if self._state_manager is not None:
+            logger.info("Lingbot-World-Fast: session state manager enabled (max_sessions=%d)", max_sessions)
 
         model_path = os.path.dirname(self.od_config.model)
         assert model_path is not None, "lingbot_dir is None"
@@ -247,6 +276,13 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         session_id = str(session_id)
 
         force_reset = req.sampling_params.extra_args.get("force_reset") or False
+
+        if self._state_manager is not None:
+            # A fresh view per request: the manager owns the session's data and
+            # its lifecycle; the adapter binds this request to its session. The
+            # fresh-versus-extension test below runs unchanged -- a session that
+            # has not run yet reads session_id None and takes the reset branch.
+            self.state = LingbotWorldFastStateAdapter(session_id, self._state_manager)
 
         extension = True
 
